@@ -1,0 +1,187 @@
+# Deploy the backend to Cloud Run for **production**.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the counterpart to `deploy.yml`, which is the DEMO deploy. The two are
+# separate files rather than one parameterised workflow on purpose: the demo
+# configuration is not a variant of the production one, it is a set of
+# affordances that must never reach real customers, and a shared workflow with a
+# flag is one wrong input away from shipping them.
+#
+# What this workflow does NOT set, and must never set:
+#
+#   OTP_DEMO_FIXED_CODE      pins every customer's sign-in code. With it set,
+#                            two API calls sign you in as any phone number.
+#   PAYMENT_MOCK_AUTO_SETTLE marks an order PAID by delivering the mock
+#                            gateway's own webhook, with no money moving.
+#   PAYMENT_SANDBOX          opens the public `simulate` webhook endpoint.
+#   NODE_ENV=staging         which is what allowed all three of the above: the
+#                            backend's guards key on NODE_ENV=production, and
+#                            the demo deploy set `staging` to route around them.
+#
+# Setting NODE_ENV=production here is what arms those guards
+# (`resolveDemoFixedCode` and `assertProductionPaymentRails` in
+# `src/config/configuration.ts`). They refuse the boot rather than fail open, so
+# a demo value that reached this path would break the deploy loudly instead of
+# quietly shipping.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# THIS WORKFLOW CANNOT SUCCEED YET, AND THAT IS CORRECT.
+#
+# Two blocked business inputs stand between here and a working production
+# deploy, and both fail loudly rather than silently:
+#
+#   1. PAYMENT_GATEWAY must not be `mock` in production, so it must be `tap` —
+#      and `TapPaymentGateway` is a deliberate stub that throws. It needs
+#      current official Tap documentation and merchant credentials. Nothing
+#      about Tap's API may be invented.
+#   2. SMS_PROVIDER has only one value today, `mock`, which delivers nothing —
+#      so no customer could receive a sign-in code. A real provider must be
+#      chosen (a business decision) and added to the `SmsProvider` enum with its
+#      adapter, alongside a guard here matching the payment one.
+#
+# Until both land, running this workflow is expected to fail at boot. That is
+# the intended behaviour: a production deploy that half-works is worse than one
+# that refuses.
+#
+# Trigger is manual (`workflow_dispatch`) and scoped to the `production`
+# GitHub Environment, so a required-reviewer rule can gate it. Production is
+# never deployed by merging.
+#
+# Required repo settings (Settings > Secrets and variables > Actions):
+#   vars.GCP_PROJECT_ID        vars.GCP_REGION         vars.CLOUDSQL_CONN
+#   vars.CLIENT_ORIGINS        vars.PAYMENT_GATEWAY    vars.SMS_PROVIDER
+#   vars.PUSH_PROVIDER         vars.PROD_SERVICE_NAME
+#   secrets.GCP_WORKLOAD_IDENTITY_PROVIDER   secrets.GCP_DEPLOY_SA_EMAIL
+#
+# Secrets are read from Secret Manager by name, never passed through GitHub.
+
+name: Deploy backend — PRODUCTION (Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy-production" to confirm. This serves real customers.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+concurrency:
+  group: deploy-backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Attach a protected GitHub Environment so a human approval can be required
+    # before this runs. Configure reviewers under Settings > Environments.
+    environment: production
+
+    steps:
+      - name: Refuse an unconfirmed run
+        if: ${{ inputs.confirm != 'deploy-production' }}
+        run: |
+          echo "::error::Confirmation phrase did not match. Nothing was deployed."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Fail before touching the database if the deploy inputs still carry demo
+      # values. The backend's own boot guards would catch these, but that
+      # happens after migrations have already run against production data.
+      - name: Refuse demo configuration
+        env:
+          PAYMENT_GATEWAY: ${{ vars.PAYMENT_GATEWAY }}
+          SMS_PROVIDER: ${{ vars.SMS_PROVIDER }}
+        run: |
+          set -euo pipefail
+          fail=0
+          if [ "${PAYMENT_GATEWAY}" = "mock" ] || [ -z "${PAYMENT_GATEWAY}" ]; then
+            echo "::error::vars.PAYMENT_GATEWAY is '${PAYMENT_GATEWAY:-unset}'. Production takes real payments; the mock gateway takes none."
+            fail=1
+          fi
+          if [ "${SMS_PROVIDER}" = "mock" ] || [ -z "${SMS_PROVIDER}" ]; then
+            echo "::error::vars.SMS_PROVIDER is '${SMS_PROVIDER:-unset}'. The mock adapter delivers nothing, so no customer could receive a sign-in code."
+            fail=1
+          fi
+          if [ "$fail" = "1" ]; then
+            echo "::error::These are the two blocked business inputs. See this workflow's header."
+            exit 1
+          fi
+          echo "Deploy inputs carry no demo values."
+
+      # Apply migrations before the new revision serves traffic, through the
+      # Cloud SQL Auth Proxy — no password or IP allowlist involved.
+      - name: Migrate and seed (Cloud SQL Auth Proxy)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSQL_CONN: ${{ vars.CLOUDSQL_CONN }}
+        run: |
+          set -euo pipefail
+
+          RAW_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL --project="$PROJECT_ID")"
+          echo "::add-mask::$RAW_URL"
+          TCP_URL="$(printf '%s' "$RAW_URL" | sed -E 's#@localhost/([^?]+)\?host=/cloudsql/[^&]+#@127.0.0.1:5432/\1#')"
+          echo "::add-mask::$TCP_URL"
+
+          curl -sSL -o cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --port 5432 "$CLOUDSQL_CONN" &
+          PROXY_PID=$!
+
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          npm ci
+          DATABASE_URL="$TCP_URL" npx prisma migrate deploy
+          DATABASE_URL="$TCP_URL" npm run prisma:seed
+
+          kill "$PROXY_PID" 2>/dev/null || true
+
+      # NODE_ENV=production is the load-bearing value here: it arms the boot
+      # guards that refuse a pinned OTP, the sandbox, the mock gateway and
+      # auto-settle. The ^@^ delimiter preserves commas inside CLIENT_ORIGINS.
+      - name: Deploy service
+        run: |
+          gcloud run deploy "${{ vars.PROD_SERVICE_NAME }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --source . \
+            --platform managed \
+            --add-cloudsql-instances "${{ vars.CLOUDSQL_CONN }}" \
+            --allow-unauthenticated \
+            --port 3000 \
+            --quiet \
+            --set-env-vars "^@^NODE_ENV=production@LOG_LEVEL=info@LOG_PRETTY=false@SWAGGER_ENABLED=false@TRUSTED_PROXY_HOPS=1@PAYMENT_GATEWAY=${{ vars.PAYMENT_GATEWAY }}@PAYMENT_SANDBOX=false@PAYMENT_MOCK_AUTO_SETTLE=false@SMS_PROVIDER=${{ vars.SMS_PROVIDER }}@PUSH_PROVIDER=${{ vars.PUSH_PROVIDER }}@VAT_STANDARD_RATE=0.15@PRICES_INCLUDE_VAT=true@DELIVERY_FEE_TAXABLE=true@LOYALTY_POINTS_PER_SAR=1@CORS_ALLOWED_ORIGINS=${{ vars.CLIENT_ORIGINS }}" \
+            --set-secrets "DATABASE_URL=DATABASE_URL:latest,JWT_ACCESS_SECRET=JWT_ACCESS_SECRET:latest"
+
+      - name: Report service URL
+        run: |
+          URL="$(gcloud run services describe "${{ vars.PROD_SERVICE_NAME }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          {
+            echo "### Production deploy complete"
+            echo ""
+            echo "- Service URL: $URL"
+            echo "- Clients use: \`$URL/api/v1\`"
+          } >> "$GITHUB_STEP_SUMMARY"

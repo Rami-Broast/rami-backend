@@ -1,0 +1,53 @@
+# Local development environment only.
+#
+# Credentials below are throwaway local values and are NOT secrets — staging and
+# production inject real values through secret management (see SECURITY.md).
+# Never point this file at a live database.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rdp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rdp
+      POSTGRES_PASSWORD: local_dev_only
+      POSTGRES_DB: rdp_dev
+    ports:
+      # Bound to loopback so the development database is not exposed on the LAN.
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U rdp -d rdp_dev']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: runtime
+    container_name: rdp-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://rdp:local_dev_only@postgres:5432/rdp_dev?schema=public
+      LOG_LEVEL: debug
+      LOG_PRETTY: 'false'
+      SWAGGER_ENABLED: 'true'
+      RATE_LIMIT_TTL_MS: 60000
+      RATE_LIMIT_MAX: 120
+      # Local development value only. Staging and production inject a real
+      # secret through secret management — never this one.
+      JWT_ACCESS_SECRET: local_dev_only_signing_key_change_me_0000
+      SMS_PROVIDER: mock
+    ports:
+      - '127.0.0.1:3000:3000'
+
+volumes:
+  postgres-data:

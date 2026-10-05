@@ -1,0 +1,84 @@
+# One-off: provision a staff account (no staff is ever seeded, by design).
+# Manual dispatch only. Credentials come in as inputs — never stored in the repo
+# — and are masked in the logs. Uses the same WIF auth + Cloud SQL Auth Proxy as
+# the deploy workflow.
+
+name: Create staff account
+
+on:
+  workflow_dispatch:
+    inputs:
+      email:
+        description: Staff email
+        required: true
+        default: owner@demo.test
+      name:
+        description: Full name
+        required: true
+        default: Demo Owner
+      role:
+        description: Role (OWNER, BRANCH_ADMIN, KITCHEN, ...)
+        required: true
+        default: OWNER
+      branch_code:
+        description: Branch code (required for non-OWNER roles; leave blank for OWNER)
+        required: false
+        default: ""
+      password:
+        description: Password (min 12 chars) — not stored anywhere
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Create staff account (Cloud SQL Auth Proxy)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSQL_CONN: ${{ vars.CLOUDSQL_CONN }}
+          STAFF_EMAIL: ${{ inputs.email }}
+          STAFF_NAME: ${{ inputs.name }}
+          STAFF_ROLE: ${{ inputs.role }}
+          STAFF_BRANCH_CODE: ${{ inputs.branch_code }}
+          STAFF_PASSWORD: ${{ inputs.password }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$STAFF_PASSWORD"
+
+          RAW_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL --project="$PROJECT_ID")"
+          echo "::add-mask::$RAW_URL"
+          TCP_URL="$(printf '%s' "$RAW_URL" | sed -E 's#@localhost/([^?]+)\?host=/cloudsql/[^&]+#@127.0.0.1:5432/\1#')"
+          echo "::add-mask::$TCP_URL"
+
+          curl -sSL -o cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --port 5432 "$CLOUDSQL_CONN" &
+          PROXY_PID=$!
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          npm ci
+          DATABASE_URL="$TCP_URL" npx ts-node scripts/create-staff-user.ts
+
+          kill "$PROXY_PID" 2>/dev/null || true

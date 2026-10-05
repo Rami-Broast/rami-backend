@@ -1,0 +1,17 @@
+node_modules
+dist
+coverage
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+logs
+test
+docs
+.vscode
+.idea
+README.md
+ARCHITECTURE.md
+SECURITY.md

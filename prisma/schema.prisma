@@ -1,0 +1,2576 @@
+// =============================================================================
+// Restaurant Delivery Platform — data model
+// =============================================================================
+//
+// PHASE 3. Conventions that apply to every model below:
+//
+//  MONEY      Integer minor units (halalas for SAR) with an explicit currency.
+//             Never Float/Double — binary floating point cannot represent
+//             decimal money exactly, and a tax audit will find the drift.
+//             Field names carry the `Minor` suffix so the unit is unambiguous
+//             at every call site. Settlement aggregates use BigInt.
+//
+//  IDS        UUIDv7 primary keys: unguessable (so an ID cannot be enumerated)
+//             yet time-sortable (so they index well). Human-readable
+//             identifiers — orderNumber, invoiceNumber — are separate fields,
+//             because exposing a sequential ID leaks order volume to
+//             competitors.
+//
+//  TIME       All timestamps are UTC. `createdAt`/`updatedAt` on mutable
+//             records; append-only tables carry `createdAt` only.
+//
+//  DELETION   Financial and audited records are soft-deleted (`deletedAt`).
+//             Ledger and audit tables are never deleted at all.
+//
+//  SNAPSHOTS  Orders and invoices copy names and prices at the time of the
+//             transaction. Menu prices change; history must not.
+//
+//  VAT        Rates and taxable-base rules are NOT decided here. This schema
+//             stores what was applied; the engine that decides it is Phase 7
+//             and requires accountant confirmation.
+//
+//  ZATCA      No ZATCA-specific invoice fields (hash, QR, XML, clearance,
+//             certificate data) appear here. They are Phase 13 and must follow
+//             official ZATCA documentation for the applicable phase/wave —
+//             guessing them would be a compliance failure, not a bug.
+//
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+enum Currency {
+  SAR
+}
+
+/// VAT classification of a sellable item. The rate attached to each class is
+/// configured by the Phase 7 pricing engine, not hard-coded here.
+enum TaxClass {
+  STANDARD
+  ZERO_RATED
+  EXEMPT
+}
+
+enum OrderType {
+  DELIVERY
+  PICKUP
+}
+
+/// Fulfilment state. Deliberately separate from PaymentStatus — one is never
+/// inferred from the other.
+enum OrderStatus {
+  PENDING_PAYMENT
+  /// Payment received (or COD placement) but the branch has manual
+  /// acceptance turned on and has not yet accepted the order.
+  AWAITING_ACCEPTANCE
+  CONFIRMED
+  PREPARING
+  READY
+  DRIVER_ASSIGNED
+  PICKED_UP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  PAYMENT_FAILED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+/// Money state. Advanced only by verified server-side gateway results — never
+/// by a client reporting success.
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  FAILED
+  CANCELLED
+  REFUND_PENDING
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  CARD
+  MADA
+  APPLE_PAY
+  GOOGLE_PAY
+  /// Paid in cash at the branch counter (Branch POS walk-in / phone order).
+  /// Recorded by staff at the point of sale — distinct from CASH_ON_DELIVERY,
+  /// which the driver collects at the door.
+  CASH
+  CASH_ON_DELIVERY
+}
+
+enum PaymentAttemptStatus {
+  INITIATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  ABANDONED
+}
+
+enum WebhookProcessingStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// What a customer is asking for when they raise a refund request.
+///
+/// Derived server-side from the order's own status rather than chosen by the
+/// customer: "cancel this" and "give me my money back" are the same request at
+/// different points in a delivery, and asking a customer to classify it is
+/// asking them to know our fulfilment model.
+enum RefundRequestType {
+  /// The order has not been handed over yet — approving it cancels the order
+  /// and refunds whatever was captured.
+  CANCELLATION
+  /// The order is already with the customer — approving refunds money and
+  /// leaves fulfilment alone.
+  REFUND
+}
+
+enum RefundRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  /// The customer withdrew it before anyone decided.
+  WITHDRAWN
+}
+
+enum InvoiceType {
+  /// B2C. Issued to a customer without a VAT registration.
+  SIMPLIFIED
+  /// B2B. Issued where the buyer's VAT registration is recorded.
+  STANDARD
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  CANCELLED
+}
+
+enum DeliveryStatus {
+  PENDING_ASSIGNMENT
+  ASSIGNED
+  PICKED_UP
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+enum VehicleType {
+  MOTORCYCLE
+  CAR
+  BICYCLE
+  ON_FOOT
+}
+
+enum ProofOfDeliveryType {
+  SIGNATURE
+  PHOTO
+  OTP
+  NONE
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+  FREE_DELIVERY
+}
+
+enum CouponRuleType {
+  FIRST_ORDER
+  MIN_SPEND
+  PRODUCT
+  CATEGORY
+  BRANCH
+  TIME_WINDOW
+  CUSTOMER_ELIGIBILITY
+}
+
+/// Ledger entry types. EARN and REDEEM are customer actions; REVERSE undoes an
+/// earn when an order is refunded or cancelled; EXPIRE ages points out; ADJUST
+/// is a manual correction and is always audited.
+enum LoyaltyTransactionType {
+  EARN
+  REDEEM
+  REVERSE
+  EXPIRE
+  ADJUST
+}
+
+enum NotificationType {
+  OTP
+  /// Placed, and waiting for the branch to accept it (manual-accept branches).
+  /// Without this, a customer ordering from a branch that eyeballs its orders
+  /// hears nothing at all between paying and the kitchen accepting.
+  ORDER_RECEIVED
+  ORDER_CONFIRMED
+  PAYMENT_FAILED
+  ORDER_PREPARING
+  ORDER_READY
+  DRIVER_ASSIGNED
+  OUT_FOR_DELIVERY
+  ORDER_DELIVERED
+  ORDER_CANCELLED
+  REFUND_UPDATE
+  PROMOTION
+}
+
+enum NotificationChannel {
+  SMS
+  PUSH
+  EMAIL
+}
+
+enum NotificationDeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum SettlementStatus {
+  EXPECTED
+  RECEIVED
+  MATCHED
+  DISCREPANCY
+}
+
+/// Outcome of matching a gateway payout line against our own records.
+/// Anything other than MATCHED requires human review.
+enum SettlementMatchStatus {
+  MATCHED
+  UNMATCHED
+  DUPLICATE
+  MISSING
+  UNEXPECTED
+}
+
+enum GatewayFeeType {
+  TRANSACTION
+  REFUND
+  CHARGEBACK
+  FIXED
+  OTHER
+}
+
+enum BranchStatus {
+  ACTIVE
+  TEMPORARILY_CLOSED
+  SUSPENDED
+  ARCHIVED
+}
+
+enum ChargeType {
+  FIXED
+  PERCENTAGE
+  PER_ITEM
+}
+
+enum ChargeAppliesTo {
+  SUBTOTAL
+  DELIVERY
+}
+
+/// What an OTP challenge authorises. Scoped so a login code can never be
+/// replayed against a different sensitive action.
+enum OtpPurpose {
+  CUSTOMER_LOGIN
+}
+
+enum ActorType {
+  USER
+  CUSTOMER
+  SYSTEM
+  GATEWAY
+}
+
+enum AuditOutcome {
+  SUCCESS
+  FAILURE
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+/// An uploaded image, stored as bytes in the database.
+///
+/// No object storage is provisioned for this platform, and the alternative on
+/// offer was asking an owner to paste a URL — so every menu photo and every
+/// offer artwork was a link to somewhere else that nobody controlled, and any
+/// of them could 404 into a customer's menu without warning.
+///
+/// Bytes in Postgres is a deliberate, bounded trade for **owner-uploaded
+/// artwork only**: a menu is tens of images, not thousands, and they are
+/// written once and read from a cache. It is the wrong home for anything
+/// high-volume — proof-of-delivery photos above all — which is why uploading is
+/// gated on `assets:write` rather than open to every client.
+///
+/// Clients only ever see `GET /assets/:id`, so moving this to GCS later is an
+/// adapter swap behind that URL and changes nothing in any app.
+model Asset {
+  id       String @id @default(uuid(7))
+  /// Validated against an allow-list on upload; echoed as the Content-Type.
+  mimeType String
+  byteSize Int
+  data     Bytes
+
+  /// The name the file had on the uploader's machine. Kept for the owner's own
+  /// recognition in a picker; never used to build a path or a URL.
+  filename String?
+
+  uploadedById String?
+  uploadedBy   User?   @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([uploadedById])
+}
+
+// =============================================================================
+// Identity and access control
+// =============================================================================
+
+/// Staff user (owner, branch admin, kitchen, driver). Customers are a separate
+/// entity — they authenticate differently and must never share a table with
+/// privileged accounts.
+model User {
+  id           String    @id @default(uuid(7))
+  email        String    @unique
+  phone        String?   @unique
+  passwordHash String
+  fullName     String
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  roles                   UserRole[]
+  refreshTokens           RefreshToken[]
+  driver                  Driver?
+  orderStatusChanges      OrderStatusHistory[]
+  deliveryStatusChanges   DeliveryStatusHistory[]
+  refundsRequested        Refund[]
+  loyaltyAdjustments      LoyaltyTransaction[]
+  auditLogs               AuditLog[]
+  notifications           Notification[]
+  cashCollectionsRecorded CashCollection[]
+  orderEditsAuthored      OrderEdit[]
+  featureFlagUpdates      FeatureFlag[]
+  assetsUploaded          Asset[]
+  refundRequestsReviewed  RefundRequest[]         @relation("RefundRequestReviewer")
+  receiptTemplateEdits    ReceiptTemplate[]
+
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+/// Canonical roles are seeded (OWNER, BRANCH_ADMIN, KITCHEN, DRIVER) and marked
+/// `isSystem` so they cannot be renamed or removed by an admin.
+model Role {
+  id          String  @id @default(uuid(7))
+  name        String  @unique
+  description String?
+  isSystem    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  permissions RolePermission[]
+  users       UserRole[]
+}
+
+model Permission {
+  id          String  @id @default(uuid(7))
+  code        String  @unique
+  description String?
+
+  createdAt DateTime @default(now())
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  createdAt DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+/// Grants a role to a user, optionally scoped to a single branch.
+///
+/// `branchId == null` means the grant spans every branch — that is how OWNER is
+/// represented. A BRANCH_ADMIN gets one row per branch they administer. This is
+/// the table the Phase 5 isolation guard reads.
+model UserRole {
+  id       String  @id @default(uuid(7))
+  userId   String
+  roleId   String
+  branchId String?
+
+  createdAt DateTime @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role    @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId, branchId])
+  @@index([userId])
+  @@index([branchId])
+  @@index([roleId])
+}
+
+// =============================================================================
+// Customers
+// =============================================================================
+
+model Customer {
+  id              String    @id @default(uuid(7))
+  /// E.164 format. The login identity for OTP authentication.
+  phone           String    @unique
+  email           String?   @unique
+  fullName        String?
+  isActive        Boolean   @default(true)
+  lastLoginAt     DateTime?
+  /// Set the first time an OTP challenge for this phone is successfully
+  /// consumed. A customer record can exist before it is verified.
+  phoneVerifiedAt DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  refreshTokens      RefreshToken[]
+  addresses          CustomerAddress[]
+  orders             Order[]
+  invoices           Invoice[]
+  couponUsages       CouponUsage[]
+  loyaltyAccount     LoyaltyAccount?
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  orderStatusChanges OrderStatusHistory[]
+  refundRequests     RefundRequest[]
+  refundWindowMisses RefundWindowMiss[]
+
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+model CustomerAddress {
+  id         String   @id @default(uuid(7))
+  customerId String
+  label      String?
+  line1      String
+  line2      String?
+  district   String?
+  city       String
+  postalCode String?
+  latitude   Decimal? @db.Decimal(10, 7)
+  longitude  Decimal? @db.Decimal(10, 7)
+  notes      String?
+  isDefault  Boolean  @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  orders   Order[]
+
+  @@index([customerId])
+}
+
+// =============================================================================
+// Branches
+// =============================================================================
+
+model Branch {
+  id          String       @id @default(uuid(7))
+  code        String       @unique
+  name        String
+  nameAr      String?
+  phone       String?
+  addressLine String
+  district    String?
+  city        String
+  latitude    Decimal?     @db.Decimal(10, 7)
+  longitude   Decimal?     @db.Decimal(10, 7)
+  isActive    Boolean      @default(true)
+  status      BranchStatus @default(ACTIVE)
+
+  /// ZATCA registration inputs for this branch (see src/zatca-invoicing/). The
+  /// chain shares one VAT number (config, not here); each branch carries its own
+  /// commercial registration and a ZATCA-structured address, which are burned
+  /// into that branch's certificate. Optional: absent leaves the branch
+  /// unregistered (or, with the mock, registered with placeholders). `addressLine`
+  /// above is the ZATCA street; these add the parts ZATCA also requires.
+  zatcaCrNumber          String?
+  zatcaBuildingNumber    String?
+  zatcaPlotIdentification String?
+  zatcaPostalCode        String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  settings           BranchSetting?
+  receiptTemplate    ReceiptTemplate?
+  openingHours       BranchOpeningHours[]
+  hoursOverrides     BranchHoursOverride[]
+  userRoles          UserRole[]
+  availability       ProductAvailability[]
+  orders             Order[]
+  invoices           Invoice[]
+  deliveries         Delivery[]
+  settlements        Settlement[]
+  auditLogs          AuditLog[]
+  cashCollections    CashCollection[]
+  orderSequence      BranchOrderSequence?
+  drivers            Driver[]
+  refundRequests     RefundRequest[]
+  refundWindowMisses RefundWindowMiss[]
+  zatcaRegistration  BranchZatcaRegistration?
+  restoposInvoices   RestoposInvoice[]
+
+  @@index([isActive])
+  @@index([status])
+}
+
+model BranchSetting {
+  id       String @id @default(uuid(7))
+  branchId String @unique
+
+  acceptsDelivery       Boolean @default(true)
+  acceptsPickup         Boolean @default(true)
+  isAcceptingOrders     Boolean @default(true)
+  /// Cash on delivery is opt-in per branch — never assumed. A branch only
+  /// offers COD when this is explicitly turned on. See Phase 8.
+  acceptsCashOnDelivery Boolean @default(false)
+
+  /// When true (the default), a paid or COD order is CONFIRMED for the kitchen
+  /// immediately. When false, the order sits in AWAITING_ACCEPTANCE until a
+  /// staff member accepts or rejects it. Per branch — a small branch may want
+  /// to eyeball every order, a big one may want the throughput.
+  autoAcceptOrders Boolean @default(true)
+
+  /// Maximum distance this branch delivers to. 25 km (owner, 2026-09-04).
+  /// **Null still means no limit** — the owner clearing the field is a
+  /// deliberate "we deliver anywhere", not a missing value — but a new branch
+  /// now starts with the owner's stated limit rather than with none.
+  deliveryRadiusKm        Decimal? @default(25) @db.Decimal(6, 2)
+  /// Base delivery fee, charged on every delivery order. 5 SAR (owner,
+  /// 2026-09-04). Its VAT treatment is decided by the Phase 7 engine after
+  /// accountant confirmation, not assumed here.
+  deliveryFeeMinor        Int      @default(500)
+  /// Distance the base fee already covers. Beyond it, deliveryPerKmFeeMinor
+  /// applies per started kilometre. 5 km (owner, 2026-09-04).
+  deliveryBaseFeeCoversKm Decimal  @default(5) @db.Decimal(6, 2)
+  /// Charged for each started kilometre past deliveryBaseFeeCoversKm.
+  /// 3 SAR (owner, 2026-09-04).
+  deliveryPerKmFeeMinor   Int      @default(300)
+  /// Straight-line distance is multiplied by this to approximate road
+  /// distance. No routing provider is contracted (same blocked-on-business
+  /// -input category as SMS and call masking), so distance is measured
+  /// geometrically and inflated. 1.3 is the usual urban approximation.
+  deliveryRoadFactor      Decimal  @default(1.3) @db.Decimal(4, 2)
+  /// Percentage added to every item price on a **delivery** order, to cover
+  /// the cost of delivering it. Folded into the item price rather than shown
+  /// as a separate line, so it sits inside the VAT-inclusive price and is
+  /// snapshotted onto the order line like any other price. A product may
+  /// override it (Product.deliveryUpliftPercent). Default 0 — no uplift until
+  /// the owner sets one.
+  deliveryUpliftPercent   Decimal  @default(0) @db.Decimal(5, 2)
+  /// Minimum item subtotal before a delivery order may be placed, measured
+  /// **before** the delivery fee — a customer must not reach it by living
+  /// further away. 40 SAR (owner, 2026-09-04).
+  minOrderMinor           Int      @default(4000)
+  prepTimeMinutes         Int      @default(20)
+
+  /// Opening hours per weekday. Shape is validated by the branches module.
+  openingHours Json?
+  timezone     String @default("Asia/Riyadh")
+
+  /// Printer model this branch uses (e.g. "epson-tm-t20iii"). Free text
+  /// rather than an enum because branches ship with different brands and the
+  /// adapter list grows as new models arrive — an enum here would force a
+  /// migration for every new adapter. The backend never talks to the printer
+  /// directly (spec §15, §31); kitchen-pos reads this to pick the right
+  /// driver at boot. Null means "no printer configured yet."
+  printerModel      String?
+  /// How kitchen-pos reaches the printer (e.g. "qz-tray", "usb", "network").
+  /// Same free-text rationale as printerModel.
+  printerConnection String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+}
+
+/// Regular weekly opening hours for a branch. Multiple rows per day allow split
+/// shifts (e.g. 08:00–12:00 and 16:00–23:00).
+model BranchOpeningHours {
+  id          String  @id @default(uuid(7))
+  branchId    String
+  dayOfWeek   Int     @db.SmallInt
+  openMinute  Int     @db.SmallInt
+  closeMinute Int     @db.SmallInt
+  isClosed    Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, dayOfWeek, openMinute])
+  @@index([branchId])
+}
+
+/// Date-specific overrides — Ramadan, holidays, ad-hoc closures. Takes
+/// precedence over the weekly BranchOpeningHours for the matching date.
+model BranchHoursOverride {
+  id          String   @id @default(uuid(7))
+  branchId    String
+  date        DateTime @db.Date
+  openMinute  Int?     @db.SmallInt
+  closeMinute Int?     @db.SmallInt
+  isClosed    Boolean  @default(false)
+  note        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, date])
+  @@index([branchId])
+}
+
+// =============================================================================
+// Charges
+// =============================================================================
+
+/// A configurable charge — service fee, packaging fee, small-order surcharge,
+/// or any owner-defined extra. Evaluated at order time by the charges engine
+/// (pure function in `src/charges/charge-evaluation.ts`) and snapshotted as
+/// `OrderCharge` rows.
+model Charge {
+  id     String  @id @default(uuid(7))
+  name   String
+  nameAr String?
+
+  type        ChargeType
+  appliesTo   ChargeAppliesTo @default(SUBTOTAL)
+  /// Fixed amount in minor units — used when type is FIXED or PER_ITEM.
+  amountMinor Int?
+  /// Percentage in basis points (100 = 1%) — used when type is PERCENTAGE.
+  percentBps  Int?
+
+  taxable  Boolean  @default(true)
+  taxClass TaxClass @default(STANDARD)
+
+  /// `null` means all branches; otherwise a JSON array of branch IDs.
+  branchIds  Json?
+  /// Conditions under which this charge applies. Shape:
+  /// `{ orderTypes?, minSubtotalMinor?, maxSubtotalMinor?, paymentMethods? }`
+  conditions Json?
+
+  priority Int       @default(0)
+  startsAt DateTime?
+  endsAt   DateTime?
+  isActive Boolean   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orderCharges OrderCharge[]
+
+  @@index([isActive, startsAt, endsAt])
+}
+
+/// Snapshot of one charge applied to an order. Immutable after creation —
+/// the charge definition may change later, but what this customer paid does not.
+model OrderCharge {
+  id       String  @id @default(uuid(7))
+  orderId  String
+  chargeId String?
+
+  name       String
+  nameAr     String?
+  grossMinor Int
+  vatMinor   Int
+  totalMinor Int
+  taxable    Boolean
+
+  createdAt DateTime @default(now())
+
+  order  Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  charge Charge? @relation(fields: [chargeId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([chargeId])
+}
+
+/// Snapshot of one discount that actually paid on an order.
+///
+/// `Order.discountMinor` is the total taken off; this is *what took it off*.
+/// The two exist together for the same reason `OrderCharge` sits beside
+/// `chargesMinor`: an aggregate cannot tell a customer which offer saved them
+/// money, and — now that a promotion and a coupon can apply to the same order
+/// — cannot tell the owner which of the two an order's giveaway came from.
+///
+/// Immutable after creation. The promotion may be edited and the coupon may
+/// expire; what this customer was given does not change.
+model OrderDiscount {
+  id      String @id @default(uuid(7))
+  orderId String
+
+  kind DiscountKind
+
+  /// Nullable + SetNull, like every other snapshot: deleting the offer must
+  /// never rewrite an order that was already discounted by it.
+  couponId    String?
+  promotionId String?
+
+  /// What to call it on a receipt: the coupon's code, or the promotion's name.
+  label                String
+  /// As given, after the engine's clamp — never the amount that was requested.
+  amountMinor          Int
+  /// True when it came off the delivery fee rather than the food.
+  appliesToDeliveryFee Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  order     Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  coupon    Coupon?    @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  promotion Promotion? @relation(fields: [promotionId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([couponId])
+  @@index([promotionId])
+}
+
+enum DiscountKind {
+  COUPON
+  PROMOTION
+}
+
+/// The receipt template a branch prints its customer docket from.
+///
+/// One row is the **organisation default** (`branchId` null, enforced single
+/// by a partial unique index in the migration — Postgres does not treat NULLs
+/// as equal, so a plain unique column would happily hold two defaults). Every
+/// other row is one branch's **partial override** of the handful of fields a
+/// branch may set for itself.
+///
+/// `config` is JSON rather than columns because it is a document layout: the
+/// section list, the header lines, the thank-you. Columns would mean a
+/// migration every time the owner wants another editable line, and nothing
+/// queries inside it — it is read whole, by one branch at a time.
+model ReceiptTemplate {
+  id String @id @default(uuid(7))
+
+  /// Null is the organisation default that every branch starts from.
+  branchId String?
+
+  config Json
+
+  updatedByUserId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch        Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  updatedByUser User?   @relation(fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([branchId])
+  @@index([updatedByUserId])
+}
+
+// =============================================================================
+// Catalog
+// =============================================================================
+
+model Category {
+  id          String  @id @default(uuid(7))
+  name        String
+  nameAr      String?
+  description String?
+  imageUrl    String?
+  sortOrder   Int     @default(0)
+  isActive    Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  products Product[]
+
+  @@index([isActive, sortOrder])
+}
+
+model Product {
+  id                    String   @id @default(uuid(7))
+  categoryId            String
+  sku                   String?  @unique
+  name                  String
+  nameAr                String?
+  description           String?
+  imageUrl              String?
+  /// Default price. A branch may override it via ProductAvailability, and a
+  /// variant may replace it entirely.
+  basePriceMinor        Int
+  /// Overrides the branch's delivery uplift for this product only. **Null
+  /// falls through to the branch default; zero is a real choice** ("never
+  /// uplift this item") and is respected. See
+  /// src/delivery-pricing/delivery-pricing.ts.
+  deliveryUpliftPercent Decimal? @db.Decimal(5, 2)
+  taxClass              TaxClass @default(STANDARD)
+  sortOrder             Int      @default(0)
+  isActive              Boolean  @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  category       Category               @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  variants       ProductVariant[]
+  modifierGroups ProductModifierGroup[]
+  availability   ProductAvailability[]
+  orderItems     OrderItem[]
+  promotionItems PromotionItem[]
+
+  @@index([categoryId])
+  @@index([isActive, sortOrder])
+}
+
+model ProductVariant {
+  id         String  @id @default(uuid(7))
+  productId  String
+  name       String
+  nameAr     String?
+  sku        String? @unique
+  /// Absolute price for this variant, replacing the product's base price.
+  priceMinor Int
+  isDefault  Boolean @default(false)
+  sortOrder  Int     @default(0)
+  isActive   Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@index([productId])
+}
+
+/// A reusable set of choices ("Choose your sauce", "Add extras"). Shared across
+/// products through ProductModifierGroup so a change is made once.
+model ModifierGroup {
+  id            String  @id @default(uuid(7))
+  name          String
+  nameAr        String?
+  minSelections Int     @default(0)
+  maxSelections Int     @default(1)
+  isRequired    Boolean @default(false)
+  isActive      Boolean @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  addons   Addon[]
+  products ProductModifierGroup[]
+}
+
+model ProductModifierGroup {
+  productId       String
+  modifierGroupId String
+  sortOrder       Int    @default(0)
+
+  createdAt DateTime @default(now())
+
+  product       Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  modifierGroup ModifierGroup @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+
+  @@id([productId, modifierGroupId])
+  @@index([modifierGroupId])
+}
+
+model Addon {
+  id              String   @id @default(uuid(7))
+  modifierGroupId String
+  name            String
+  nameAr          String?
+  priceMinor      Int      @default(0)
+  taxClass        TaxClass @default(STANDARD)
+  sortOrder       Int      @default(0)
+  isActive        Boolean  @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  modifierGroup      ModifierGroup       @relation(fields: [modifierGroupId], references: [id], onDelete: Cascade)
+  orderItemModifiers OrderItemModifier[]
+
+  @@index([modifierGroupId])
+}
+
+/// Per-branch availability and optional price override for a product.
+///
+/// This is what makes the menu branch-aware: one catalog, with each branch
+/// controlling what it actually sells and — where the business allows it — at
+/// what price.
+model ProductAvailability {
+  id        String @id @default(uuid(7))
+  productId String
+  branchId  String
+
+  isAvailable         Boolean   @default(true)
+  priceOverrideMinor  Int?
+  /// Set when a branch runs out temporarily; cleared when restocked.
+  unavailableUntil    DateTime?
+  /// Optional daily serving window (minutes from midnight, branch timezone).
+  availableFromMinute Int?
+  availableToMinute   Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  branch  Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, branchId])
+  @@index([branchId, isAvailable])
+}
+
+// =============================================================================
+// Orders
+// =============================================================================
+
+model Order {
+  id          String @id @default(uuid(7))
+  /// Human-readable order number shown to the customer and printed in the
+  /// kitchen. Allocated per branch from `BranchOrderSequence`, starting at
+  /// 1000000 and incrementing by one for every order that branch takes, so
+  /// each branch counts its own orders. Unique *per branch* — two branches
+  /// legitimately both have an order "1000000".
+  orderNumber String
+  /// Globally unique 12-digit public reference. Because `orderNumber` is
+  /// sequential within a branch (and therefore guessable), this is the handle
+  /// used to identify one order across the whole platform — on the customer's
+  /// order summary, the branch docket and the admin views. Random, not
+  /// sequential, so it leaks neither order volume nor another customer's order.
+  referenceId String @unique
+
+  branchId          String
+  customerId        String
+  customerAddressId String?
+  couponId          String?
+  /// The automatic promotion applied at placement, if any.
+  ///
+  /// Separate from `couponId` because they are different acts: a coupon is a
+  /// code the customer typed, a promotion is a standing offer they never asked
+  /// for. Only one of the two ever applies to an order (they do not stack), but
+  /// keeping two columns is what lets a report say which — and "how much of last
+  /// month's discount did our own promotions give away" is not answerable from a
+  /// single merged column.
+  promotionId       String?
+
+  type          OrderType
+  status        OrderStatus   @default(PENDING_PAYMENT)
+  /// Tracked independently of `status`. Neither is derived from the other.
+  paymentStatus PaymentStatus @default(PENDING)
+
+  // --- Price snapshot -------------------------------------------------------
+  // Written once by the Phase 7 pricing engine and never recomputed. Menu
+  // prices change; what this customer was charged does not.
+  currency         Currency @default(SAR)
+  subtotalMinor    Int
+  discountMinor    Int      @default(0)
+  deliveryFeeMinor Int      @default(0)
+  chargesMinor     Int      @default(0)
+  taxableBaseMinor Int
+  vatMinor         Int
+  totalMinor       Int
+  /// VAT rate actually applied, e.g. 0.1500. Snapshotted so a future rate
+  /// change cannot rewrite historical tax.
+  vatRate          Decimal  @db.Decimal(6, 4)
+  /// Full pricing-engine output, retained for dispute resolution and audit.
+  priceBreakdown   Json?
+
+  scheduledFor       DateTime?
+  placedAt           DateTime  @default(now())
+  confirmedAt        DateTime?
+  preparingAt        DateTime?
+  readyAt            DateTime?
+  deliveredAt        DateTime?
+  cancelledAt        DateTime?
+  cancellationReason String?
+  customerNotes      String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  branch           Branch                @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  customer         Customer              @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customerAddress  CustomerAddress?      @relation(fields: [customerAddressId], references: [id], onDelete: SetNull)
+  coupon           Coupon?               @relation(fields: [couponId], references: [id], onDelete: SetNull)
+  promotion        Promotion?            @relation(fields: [promotionId], references: [id], onDelete: SetNull)
+  items            OrderItem[]
+  orderCharges     OrderCharge[]
+  discounts        OrderDiscount[]
+  statusHistory    OrderStatusHistory[]
+  payments         Payment[]
+  paymentAttempts  PaymentAttempt[]
+  refunds          Refund[]
+  invoice          Invoice?
+  restoposInvoices RestoposInvoice[]
+  delivery         Delivery?
+  couponUsage      CouponUsage?
+  loyaltyEntries   LoyaltyTransaction[]
+  notifications    Notification[]
+  webhookEvents    PaymentWebhookEvent[]
+  edits            OrderEdit[]
+  refundRequests   RefundRequest[]
+  refundWindowMiss RefundWindowMiss?
+
+  @@unique([branchId, orderNumber])
+  @@index([branchId, status])
+  @@index([customerId])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([placedAt])
+  @@index([couponId])
+  @@index([promotionId])
+  @@index([customerAddressId])
+}
+
+/// Per-branch order-number counter.
+///
+/// One row per branch holding the next number to hand out. Allocation is a
+/// single atomic `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`, run inside
+/// the order-creation transaction — the database, not application code, is
+/// what stops two concurrent orders in the same branch taking the same number
+/// (a read-then-write check would let both pass). Because it shares the order
+/// transaction, a rolled-back order gives its number back rather than leaving
+/// a gap.
+model BranchOrderSequence {
+  branchId   String @id
+  /// The number the next order in this branch will get. Starts at 1000000.
+  nextNumber Int    @default(1000000)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+}
+
+/// Append-only audit trail of edits made to an order after placement.
+///
+/// Records who / why / old / new (spec §32). `snapshotBefore` /
+/// `snapshotAfter` are stored as JSON to capture whichever fields the edit
+/// touched, so future edit shapes don't need a schema migration to be
+/// tracked. Never deleted: the paper trail of what changed and who did it
+/// is the whole point.
+model OrderEdit {
+  id             String          @id @default(uuid(7))
+  orderId        String
+  orderItemId    String?
+  editedByUserId String
+  action         OrderEditAction
+  /// Free-text staff reason. Required for every edit — the "why" is the
+  /// question a manager asks when a customer disputes an adjustment.
+  reason         String
+  snapshotBefore Json?
+  snapshotAfter  Json?
+
+  createdAt DateTime @default(now())
+
+  order        Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem    OrderItem? @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+  editedByUser User       @relation(fields: [editedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, createdAt])
+  @@index([editedByUserId, createdAt])
+  @@index([orderItemId])
+}
+
+enum OrderEditAction {
+  UPDATE_ITEM_QUANTITY
+  UPDATE_ITEM_NOTES
+  REMOVE_ITEM
+  ADD_ITEM
+  UPDATE_ORDER_NOTES
+}
+
+model OrderItem {
+  id      String @id @default(uuid(7))
+  orderId String
+
+  /// Nullable and SetNull on delete: the snapshot fields below are the record
+  /// of what was sold. A catalog change must never rewrite an order.
+  productId        String?
+  productVariantId String?
+
+  // --- Snapshot -------------------------------------------------------------
+  productName String
+  variantName String?
+  taxClass    TaxClass @default(STANDARD)
+
+  unitPriceMinor    Int
+  quantity          Int
+  lineSubtotalMinor Int
+  lineDiscountMinor Int @default(0)
+  lineVatMinor      Int
+  lineTotalMinor    Int
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order          Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product        Product?            @relation(fields: [productId], references: [id], onDelete: SetNull)
+  productVariant ProductVariant?     @relation(fields: [productVariantId], references: [id], onDelete: SetNull)
+  modifiers      OrderItemModifier[]
+  edits          OrderEdit[]
+
+  @@index([orderId])
+  @@index([productId])
+  @@index([productVariantId])
+}
+
+model OrderItemModifier {
+  id          String  @id @default(uuid(7))
+  orderItemId String
+  addonId     String?
+
+  // --- Snapshot -------------------------------------------------------------
+  modifierGroupName String
+  addonName         String
+  unitPriceMinor    Int
+  quantity          Int    @default(1)
+  lineTotalMinor    Int
+
+  createdAt DateTime @default(now())
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  addon     Addon?    @relation(fields: [addonId], references: [id], onDelete: SetNull)
+
+  @@index([orderItemId])
+  @@index([addonId])
+}
+
+/// Append-only trail of every order state transition.
+model OrderStatusHistory {
+  id      String @id @default(uuid(7))
+  orderId String
+
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+
+  changedByUserId     String?
+  changedByCustomerId String?
+  reason              String?
+
+  createdAt DateTime @default(now())
+
+  order             Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  changedByUser     User?     @relation(fields: [changedByUserId], references: [id], onDelete: SetNull)
+  changedByCustomer Customer? @relation(fields: [changedByCustomerId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, createdAt])
+  @@index([changedByCustomerId])
+  @@index([changedByUserId])
+}
+
+// =============================================================================
+// Payments
+// =============================================================================
+
+/// A payment intent against an order. Multiple attempts may sit beneath one
+/// payment; a failed card retried successfully is one Payment, two attempts.
+model Payment {
+  id      String @id @default(uuid(7))
+  orderId String
+
+  status PaymentStatus  @default(PENDING)
+  method PaymentMethod?
+
+  currency            Currency @default(SAR)
+  amountMinor         Int
+  capturedAmountMinor Int      @default(0)
+  refundedAmountMinor Int      @default(0)
+
+  gatewayName      String
+  /// Gateway's own identifier. Unique per gateway so a duplicate callback
+  /// cannot create a second payment row.
+  gatewayPaymentId String?
+  gatewayReference String?
+  gatewayFeeMinor  Int?
+
+  authorizedAt  DateTime?
+  capturedAt    DateTime?
+  failedAt      DateTime?
+  /// Safe, human-readable reason. Never stores raw gateway credentials.
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order                  Order                   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  attempts               PaymentAttempt[]
+  refunds                Refund[]
+  invoice                Invoice?
+  webhookEvents          PaymentWebhookEvent[]
+  gatewayFees            GatewayFee[]
+  settlementTransactions SettlementTransaction[]
+
+  @@unique([gatewayName, gatewayPaymentId])
+  @@index([orderId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+/// One try at paying. Modelled separately from Order and Payment so that a
+/// customer retrying a declined card leaves an auditable trail rather than
+/// mutating history.
+model PaymentAttempt {
+  id        String @id @default(uuid(7))
+  paymentId String
+  orderId   String
+
+  attemptNumber Int
+  status        PaymentAttemptStatus @default(INITIATED)
+  method        PaymentMethod?
+
+  currency    Currency @default(SAR)
+  amountMinor Int
+
+  gatewayAttemptId String?
+  /// Gateway response code and safe message only. Request/response bodies are
+  /// deliberately not stored here — they can carry cardholder data.
+  responseCode     String?
+  responseMessage  String?
+
+  /// Required for every attempt. A replayed create-payment request with the
+  /// same key must not produce a second charge.
+  idempotencyKey String @unique
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, attemptNumber])
+  @@index([orderId])
+  @@index([status])
+}
+
+/// Raw inbound gateway webhook.
+///
+/// `gatewayEventId` is unique per gateway: that constraint is what makes
+/// webhook processing idempotent, since gateways retry deliveries and may send
+/// the same event more than once.
+model PaymentWebhookEvent {
+  id             String @id @default(uuid(7))
+  gatewayName    String
+  gatewayEventId String
+  eventType      String
+
+  /// False until the signature has been checked. An event must never be acted
+  /// upon while this is false.
+  signatureVerified Boolean @default(false)
+
+  /// Raw payload retained for reconciliation and dispute evidence. Sensitive
+  /// fields are redacted before this record is ever logged.
+  payload Json
+
+  processingStatus WebhookProcessingStatus @default(RECEIVED)
+  processingError  String?
+  processedAt      DateTime?
+  attempts         Int                     @default(0)
+
+  paymentId String?
+  orderId   String?
+
+  receivedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  order   Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@unique([gatewayName, gatewayEventId])
+  @@index([processingStatus])
+  @@index([receivedAt])
+  @@index([orderId])
+  @@index([paymentId])
+}
+
+// =============================================================================
+// Refunds
+// =============================================================================
+
+model Refund {
+  id        String @id @default(uuid(7))
+  paymentId String
+  orderId   String
+
+  currency    Currency     @default(SAR)
+  amountMinor Int
+  status      RefundStatus @default(PENDING)
+  reason      String
+
+  requestedByUserId String?
+
+  /// Required. Prevents a double-click or a retried request from issuing two
+  /// refunds for the same intent.
+  idempotencyKey String @unique
+
+  gatewayRefundId  String?
+  gatewayReference String?
+
+  /// True when a person issued this refund in the gateway's own dashboard and
+  /// recorded it here afterwards, rather than the platform calling the gateway.
+  ///
+  /// It is the owner's chosen way of working while the real Tap adapter does not
+  /// exist, and the distinction has to survive in the data: a manually recorded
+  /// refund has no `gatewayRefundId`, so no webhook will ever confirm it, and
+  /// anything reasoning about refunds in flight must not sit waiting for one.
+  /// `gatewayReference` carries what the person pasted from the dashboard, which
+  /// is what ties this row to the payout line at reconciliation.
+  issuedManually Boolean @default(false)
+
+  requestedAt   DateTime  @default(now())
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payment                Payment                 @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  order                  Order                   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  requestedByUser        User?                   @relation(fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  creditNotes            CreditNote[]
+  loyaltyEntries         LoyaltyTransaction[]
+  gatewayFees            GatewayFee[]
+  settlementTransactions SettlementTransaction[]
+  refundRequest          RefundRequest?
+
+  @@index([paymentId])
+  @@index([orderId])
+  @@index([status])
+  @@index([requestedByUserId])
+}
+
+/// A customer who was turned away by a refund/cancellation window, and by how
+/// much they missed it.
+///
+/// **This table exists because the policy's failures are otherwise invisible.**
+/// An approved or declined request leaves a `RefundRequest` row somebody can
+/// read; a customer told "the window has closed" leaves nothing at all — the
+/// eligibility rule refuses before anything is written. So if 10 minutes turns
+/// out to be too short, the platform would never say so: it would surface as
+/// phone calls to branches and complaints that never reach us.
+///
+/// `minutesLate` is the whole point. "How many people missed it" is a number an
+/// owner can argue with; "and 80% of them were within four minutes" is a number
+/// that answers what the window should be.
+///
+/// One row per order, not per screen open: the eligibility read runs every time
+/// the order screen is opened, and counting those would measure how often people
+/// re-check rather than how often we refuse. It is written best-effort and never
+/// blocks the read.
+model RefundWindowMiss {
+  id String @id @default(uuid(7))
+
+  /// One row per order — the unique constraint is what stops a customer
+  /// refreshing their order screen from looking like twenty refused customers.
+  orderId    String @unique
+  customerId String
+  branchId   String
+
+  /// What they would have been asking for, had the window been open.
+  type RefundRequestType
+
+  /// How long after the window shut they looked, in whole minutes. Zero means
+  /// they were seconds late.
+  minutesLate Int
+
+  /// The window they missed, in minutes, as configured when they missed it — so
+  /// a later change to the policy does not silently rewrite what this row means.
+  windowMinutes Int
+
+  createdAt DateTime @default(now())
+
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  branch   Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId, createdAt])
+  @@index([type, createdAt])
+  @@index([customerId])
+}
+
+/// A customer's request to cancel an order or have money returned.
+///
+/// This is the *ask*, not the money. A `Refund` is a movement of funds that
+/// only staff may start; a `RefundRequest` is a customer saying they want one,
+/// which staff approve or refuse. Keeping them as two tables is what lets a
+/// refused request still exist — a refund row for something nobody refunded
+/// would be a lie about the money — and it is what gives the branch a queue to
+/// work rather than a phone call to remember.
+///
+/// The row is its own audited record: who asked, why, who decided, when, and
+/// what was decided. Nothing here writes `AuditLog`; this codebase has no
+/// audit-writing convention yet, and setting one deliberately is a better idea
+/// than making a customer-facing feature the first writer.
+model RefundRequest {
+  id String @id @default(uuid(7))
+
+  orderId    String
+  customerId String
+  /// Denormalised from the order so the branch queue is one indexed read and
+  /// branch isolation does not depend on a join. Never written independently —
+  /// it is copied from the order at creation and orders do not move branch.
+  branchId   String
+
+  type   RefundRequestType
+  status RefundRequestStatus @default(PENDING)
+
+  /// The customer's own words. Shown to staff verbatim; it is the whole basis
+  /// on which someone decides.
+  reason String
+
+  /// What staff decided, in words the customer reads. Required on a rejection —
+  /// "no" with no reason is what turns one refusal into three phone calls.
+  resolutionNote String?
+
+  reviewedByUserId String?
+  reviewedAt       DateTime?
+
+  /// The refund this approval actually issued, when one could be issued. Null on
+  /// an approval that had no gateway payment to refund (cash, or cash on
+  /// delivery), which is settled at the branch and must not be recorded here as
+  /// money that moved.
+  refundId String? @unique
+
+  /// True when approving this request also cancelled the order. An order past
+  /// pickup cannot legally be cancelled, so an approved refund on a delivered
+  /// order leaves fulfilment exactly where it was.
+  orderCancelled Boolean @default(false)
+
+  /// What the branch agreed to give back, in minor units, when they approved.
+  ///
+  /// Recorded at the decision because the decision and the payout are two acts
+  /// by two different people: a branch approves, and the owner then issues the
+  /// money in the gateway's own dashboard. Without this the platform would know
+  /// a request was approved and not how much was owed — which is the state a
+  /// queue rots in.
+  approvedAmountMinor Int?
+
+  /// When the owner recorded that the money actually went back. Null on an
+  /// approved request means **money is still owed**; that is the difference
+  /// between a decision and a payout, and no screen may conflate them.
+  refundIssuedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  branch         Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  reviewedByUser User?    @relation("RefundRequestReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  refund         Refund?  @relation(fields: [refundId], references: [id], onDelete: SetNull)
+
+  @@index([branchId, status])
+  @@index([orderId])
+  @@index([customerId, createdAt])
+  @@index([status, createdAt])
+  // The owner's payout queue: approved, and the money not yet sent. Declared
+  // here as well as in the migration — the migration created it and the model
+  // did not know, which is drift, and the next `migrate dev` would have written
+  // a migration dropping it again.
+  @@index([status, refundIssuedAt])
+  @@index([reviewedByUserId])
+}
+
+// =============================================================================
+// Invoicing
+// =============================================================================
+
+/// Tax invoice for a completed order.
+///
+/// Deliberately contains NO ZATCA-specific fields (invoice hash, previous
+/// invoice hash, UUID, QR payload, signed XML, clearance status). Those are
+/// Phase 13 and must be modelled from official ZATCA documentation for the
+/// restaurant's applicable phase/wave.
+model Invoice {
+  id            String @id @default(uuid(7))
+  /// Human-readable sequential invoice reference, distinct from `id`.
+  invoiceNumber String @unique
+
+  orderId    String  @unique
+  paymentId  String? @unique
+  customerId String
+  branchId   String
+
+  type   InvoiceType   @default(SIMPLIFIED)
+  status InvoiceStatus @default(DRAFT)
+
+  currency         Currency @default(SAR)
+  subtotalMinor    Int
+  discountMinor    Int      @default(0)
+  taxableBaseMinor Int
+  vatMinor         Int
+  totalMinor       Int
+  vatRate          Decimal  @db.Decimal(6, 4)
+
+  // Seller details snapshotted at issue time — registration details change.
+  sellerName      String
+  sellerVatNumber String
+  sellerAddress   String
+
+  // Buyer details are required for STANDARD (B2B) invoices only.
+  buyerName      String?
+  buyerVatNumber String?
+  buyerAddress   String?
+
+  issuedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  order       Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  payment     Payment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  customer    Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  branch      Branch        @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  lines       InvoiceLine[]
+  creditNotes CreditNote[]
+  debitNotes  DebitNote[]
+
+  @@index([branchId, issuedAt])
+  @@index([customerId])
+  @@index([status])
+}
+
+model InvoiceLine {
+  id        String @id @default(uuid(7))
+  invoiceId String
+
+  description      String
+  quantity         Int
+  unitPriceMinor   Int
+  discountMinor    Int     @default(0)
+  taxableBaseMinor Int
+  vatRate          Decimal @db.Decimal(6, 4)
+  vatMinor         Int
+  totalMinor       Int
+  sortOrder        Int     @default(0)
+
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+/// Issued when value is returned to the customer — refunds and cancellations.
+model CreditNote {
+  id         String  @id @default(uuid(7))
+  noteNumber String  @unique
+  invoiceId  String
+  refundId   String?
+
+  reason String
+
+  currency      Currency @default(SAR)
+  subtotalMinor Int
+  vatMinor      Int
+  totalMinor    Int
+  vatRate       Decimal  @db.Decimal(6, 4)
+
+  issuedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  refund  Refund? @relation(fields: [refundId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([refundId])
+}
+
+/// Issued when additional value is charged against an existing invoice.
+model DebitNote {
+  id         String @id @default(uuid(7))
+  noteNumber String @unique
+  invoiceId  String
+
+  reason String
+
+  currency      Currency @default(SAR)
+  subtotalMinor Int
+  vatMinor      Int
+  totalMinor    Int
+  vatRate       Decimal  @db.Decimal(6, 4)
+
+  issuedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@index([invoiceId])
+}
+
+// =============================================================================
+// Delivery
+// =============================================================================
+
+model Driver {
+  id     String @id @default(uuid(7))
+  /// A driver is a staff user with the DRIVER role; this record holds the
+  /// delivery-specific profile.
+  userId String @unique
+
+  /// The branch this driver works for.
+  ///
+  /// Without it drivers could not be branch-scoped at all, and `GET /drivers`
+  /// returned every driver in the organisation to any branch admin — name,
+  /// email, licence number, vehicle plate and **live GPS coordinates**
+  /// included. It also meant any driver could be assigned to any branch's
+  /// delivery.
+  ///
+  /// Nullable because a driver profile can exist before anyone says where they
+  /// work, and because that is the fail-closed direction: an unassigned driver
+  /// matches no branch filter, so branch staff cannot see them. An owner still
+  /// sees everyone.
+  branchId String?
+
+  licenseNumber String?
+  vehicleType   VehicleType @default(MOTORCYCLE)
+  vehiclePlate  String?
+
+  isOnline    Boolean @default(false)
+  isAvailable Boolean @default(false)
+
+  currentLatitude  Decimal?  @db.Decimal(10, 7)
+  currentLongitude Decimal?  @db.Decimal(10, 7)
+  lastLocationAt   DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch          Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  deliveries      Delivery[]
+  cashCollections CashCollection[]
+
+  @@index([isOnline, isAvailable])
+  @@index([branchId])
+}
+
+model Delivery {
+  id       String  @id @default(uuid(7))
+  orderId  String  @unique
+  branchId String
+  driverId String?
+
+  status DeliveryStatus @default(PENDING_ASSIGNMENT)
+
+  /// Address copied at assignment time. A customer editing or deleting a saved
+  /// address must not change where a past order went.
+  addressSnapshot Json
+  distanceKm      Decimal? @db.Decimal(8, 3)
+
+  assignedAt    DateTime?
+  pickedUpAt    DateTime?
+  deliveredAt   DateTime?
+  cancelledAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  proofType     ProofOfDeliveryType @default(NONE)
+  proofUrl      String?
+  recipientName String?
+  notes         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order          Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  branch         Branch                  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  driver         Driver?                 @relation(fields: [driverId], references: [id], onDelete: SetNull)
+  statusHistory  DeliveryStatusHistory[]
+  cashCollection CashCollection?
+
+  @@index([branchId, status])
+  @@index([driverId, status])
+}
+
+/// Cash collected by a driver against a cash-on-delivery order.
+///
+/// One row per delivery — the driver reports what they actually received;
+/// `expectedMinor` is copied from the parent Payment at record time so a
+/// later payment tweak (which shouldn't happen for a COD, but the schema
+/// allows it) never rewrites history. `varianceMinor = collected − expected`
+/// so a positive number means the driver held extra cash, a negative one
+/// means a shortfall. Immutable once set (no update endpoint); a correction
+/// is a separate row on a separate delivery in practice.
+model CashCollection {
+  id                String  @id @default(uuid(7))
+  deliveryId        String  @unique
+  driverId          String
+  branchId          String
+  expectedMinor     Int
+  collectedMinor    Int
+  varianceMinor     Int
+  note              String?
+  collectedByUserId String
+
+  createdAt DateTime @default(now())
+
+  delivery        Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  driver          Driver   @relation(fields: [driverId], references: [id], onDelete: Restrict)
+  branch          Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  collectedByUser User     @relation(fields: [collectedByUserId], references: [id], onDelete: Restrict)
+
+  @@index([driverId, createdAt])
+  @@index([branchId, createdAt])
+  @@index([collectedByUserId])
+}
+
+/// Append-only trail of delivery transitions, with location where captured.
+model DeliveryStatusHistory {
+  id         String @id @default(uuid(7))
+  deliveryId String
+
+  fromStatus DeliveryStatus?
+  toStatus   DeliveryStatus
+
+  changedByUserId String?
+  latitude        Decimal? @db.Decimal(10, 7)
+  longitude       Decimal? @db.Decimal(10, 7)
+  note            String?
+
+  createdAt DateTime @default(now())
+
+  delivery      Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  changedByUser User?    @relation(fields: [changedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([deliveryId, createdAt])
+  @@index([changedByUserId])
+}
+
+// =============================================================================
+// Coupons
+// =============================================================================
+
+model Coupon {
+  id          String  @id @default(uuid(7))
+  code        String  @unique
+  name        String
+  description String?
+
+  discountType     DiscountType
+  /// Percentage (e.g. 10.00 for 10%) or an amount in minor units, per
+  /// `discountType`. Interpreted by the Phase 7 pricing engine.
+  discountValue    Decimal      @db.Decimal(12, 2)
+  /// Ceiling for percentage discounts.
+  maxDiscountMinor Int?
+
+  validFrom  DateTime
+  validUntil DateTime
+
+  totalUsageLimit  Int?
+  perCustomerLimit Int?
+  /// Maintained transactionally alongside CouponUsage inserts. The
+  /// authoritative usage record is CouponUsage; this is a guard for cheap
+  /// limit checks.
+  usageCount       Int  @default(0)
+
+  isActive Boolean @default(true)
+
+  /// Listed on the customer app's **Offers** page, code and all.
+  ///
+  /// Off by default: a coupon is as often a private, targeted or single-customer
+  /// apology as it is a public promotion, and publishing one by accident hands
+  /// its code to everybody. The owner opts an offer in.
+  isPublic Boolean @default(false)
+
+  /// Artwork for the offer card in the app, supplied by the owner.
+  ///
+  /// A URL, not an upload: no object storage is provisioned (the same
+  /// blocked-on-infrastructure category as proof-of-delivery photos), so the
+  /// owner points at an image they host. When storage lands, an upload writes
+  /// its URL here and nothing else changes.
+  imageUrl String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  rules          CouponRule[]
+  usages         CouponUsage[]
+  orders         Order[]
+  orderDiscounts OrderDiscount[]
+
+  @@index([isActive, validFrom, validUntil])
+  @@index([isPublic, isActive, validUntil])
+}
+
+/// One eligibility condition. A coupon's rules are ANDed together.
+model CouponRule {
+  id       String         @id @default(uuid(7))
+  couponId String
+  ruleType CouponRuleType
+  /// Rule parameters, shape determined by `ruleType` and validated by the
+  /// coupons module (e.g. { "minSpendMinor": 5000 }).
+  config   Json
+
+  createdAt DateTime @default(now())
+
+  coupon Coupon @relation(fields: [couponId], references: [id], onDelete: Cascade)
+
+  @@index([couponId])
+}
+
+/// Records that a coupon was consumed by an order.
+///
+/// The unique constraint on `orderId` is what makes reuse prevention atomic:
+/// two concurrent checkouts racing to redeem the same coupon cannot both
+/// insert, so the database rejects the second rather than the application
+/// having to win a read-then-write race.
+model CouponUsage {
+  id         String @id @default(uuid(7))
+  couponId   String
+  customerId String
+  orderId    String @unique
+
+  discountAppliedMinor Int
+
+  usedAt DateTime @default(now())
+
+  coupon   Coupon   @relation(fields: [couponId], references: [id], onDelete: Restrict)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([couponId, orderId])
+  @@index([couponId, customerId])
+  @@index([customerId])
+}
+
+// =============================================================================
+// Loyalty
+// =============================================================================
+
+/// A customer's loyalty enrolment.
+///
+/// Deliberately holds NO balance column. The balance is the sum of the
+/// account's ledger entries — a stored counter would be a second source of
+/// truth that can silently drift from the transactions that justify it.
+model LoyaltyAccount {
+  id         String  @id @default(uuid(7))
+  customerId String  @unique
+  isActive   Boolean @default(true)
+  tier       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer     Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  transactions LoyaltyTransaction[]
+}
+
+/// Append-only points ledger. Rows are never updated or deleted — a correction
+/// is a new entry, so the history of how a balance was reached stays intact.
+model LoyaltyTransaction {
+  id               String                 @id @default(uuid(7))
+  loyaltyAccountId String
+  type             LoyaltyTransactionType
+
+  /// Signed: positive for EARN, negative for REDEEM/REVERSE/EXPIRE. The
+  /// balance is SUM(points) over the account.
+  points Int
+
+  orderId  String?
+  refundId String?
+  rewardId String?
+  reason   String?
+
+  /// When these points lapse, for EARN entries under an expiry policy.
+  expiresAt DateTime?
+
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  loyaltyAccount LoyaltyAccount @relation(fields: [loyaltyAccountId], references: [id], onDelete: Cascade)
+  order          Order?         @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  refund         Refund?        @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  reward         Reward?        @relation(fields: [rewardId], references: [id], onDelete: SetNull)
+  createdByUser  User?          @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([loyaltyAccountId, createdAt])
+  @@index([orderId])
+  @@index([type])
+  @@index([createdByUserId])
+  @@index([refundId])
+  @@index([rewardId])
+}
+
+model Reward {
+  id          String  @id @default(uuid(7))
+  name        String
+  description String?
+  pointsCost  Int
+  /// Reward parameters, e.g. { "type": "FREE_PRODUCT", "productId": "..." }.
+  config      Json?
+
+  validFrom  DateTime?
+  validUntil DateTime?
+  isActive   Boolean   @default(true)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  transactions LoyaltyTransaction[]
+}
+
+// =============================================================================
+// Notifications
+// =============================================================================
+
+/// A notification event.
+///
+/// For OTP notifications the code itself must NEVER be written to `body` or
+/// `data` — those fields are readable by staff tooling and reach log
+/// aggregators. Store the delivery record, not the secret.
+model Notification {
+  id   String           @id @default(uuid(7))
+  type NotificationType
+
+  customerId String?
+  userId     String?
+  orderId    String?
+
+  title String
+  body  String
+  /// Structured payload for deep links, e.g. { "orderId": "..." }.
+  data  Json?
+
+  createdAt DateTime @default(now())
+
+  customer   Customer?              @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  user       User?                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order      Order?                 @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  deliveries NotificationDelivery[]
+
+  @@index([customerId, createdAt])
+  @@index([type])
+  @@index([orderId])
+  @@index([userId])
+}
+
+/// One send of a notification over one channel. A single notification may be
+/// delivered over several channels, each tracked independently.
+model NotificationDelivery {
+  id             String              @id @default(uuid(7))
+  notificationId String
+  channel        NotificationChannel
+  /// Provider name only, never provider credentials.
+  provider       String
+
+  status            NotificationDeliveryStatus @default(QUEUED)
+  providerMessageId String?
+  attempts          Int                        @default(0)
+
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@index([notificationId])
+  @@index([status])
+}
+
+// =============================================================================
+// Settlement and reconciliation
+// =============================================================================
+
+/// A gateway payout period.
+///
+/// Amounts are BigInt because these aggregate many orders, and an Int in minor
+/// units caps out at roughly 21 million SAR.
+///
+/// `expectedNetMinor` is derived from our own payment and refund records;
+/// `actualNetMinor` comes from the gateway's payout report. Settlement is never
+/// derived from order totals alone — that would hide gateway fees and
+/// adjustments entirely.
+model Settlement {
+  id                  String  @id @default(uuid(7))
+  gatewayName         String
+  settlementReference String
+  branchId            String?
+
+  periodStart DateTime
+  periodEnd   DateTime
+
+  currency         Currency @default(SAR)
+  grossSalesMinor  BigInt   @default(0)
+  discountsMinor   BigInt   @default(0)
+  refundsMinor     BigInt   @default(0)
+  gatewayFeesMinor BigInt   @default(0)
+  expectedNetMinor BigInt   @default(0)
+  actualNetMinor   BigInt?
+  /// actual − expected. Non-zero requires investigation before sign-off.
+  varianceMinor    BigInt?
+
+  status     SettlementStatus @default(EXPECTED)
+  payoutDate DateTime?
+  matchedAt  DateTime?
+  notes      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  branch       Branch?                 @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  transactions SettlementTransaction[]
+
+  @@unique([gatewayName, settlementReference])
+  @@index([status])
+  @@index([periodStart, periodEnd])
+  @@index([branchId])
+}
+
+/// One line of a gateway payout, matched against our payment or refund record.
+model SettlementTransaction {
+  id           String @id @default(uuid(7))
+  settlementId String
+
+  paymentId String?
+  refundId  String?
+
+  currency    Currency @default(SAR)
+  amountMinor Int
+  feeMinor    Int      @default(0)
+  netMinor    Int
+
+  matchStatus      SettlementMatchStatus @default(UNMATCHED)
+  gatewayReference String?
+  notes            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  settlement  Settlement   @relation(fields: [settlementId], references: [id], onDelete: Cascade)
+  payment     Payment?     @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  refund      Refund?      @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  gatewayFees GatewayFee[]
+
+  @@index([settlementId, matchStatus])
+  @@index([paymentId])
+  @@index([refundId])
+}
+
+/// A fee charged by the gateway. Recorded separately so that net revenue is
+/// always reconstructible from source rather than inferred.
+model GatewayFee {
+  id          String         @id @default(uuid(7))
+  gatewayName String
+  feeType     GatewayFeeType @default(TRANSACTION)
+
+  currency Currency @default(SAR)
+  feeMinor Int
+
+  paymentId               String?
+  refundId                String?
+  settlementTransactionId String?
+
+  description String?
+  createdAt   DateTime @default(now())
+
+  payment               Payment?               @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  refund                Refund?                @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  settlementTransaction SettlementTransaction? @relation(fields: [settlementTransactionId], references: [id], onDelete: SetNull)
+
+  @@index([paymentId])
+  @@index([refundId])
+  @@index([settlementTransactionId])
+}
+
+// =============================================================================
+// Audit
+// =============================================================================
+
+/// Append-only record of every financial and authorization-relevant action.
+///
+/// `before`/`after` hold redacted snapshots — they must never contain secrets,
+/// tokens or raw payment credentials. `correlationId` ties an entry back to the
+/// request logs that produced it.
+model AuditLog {
+  id        String    @id @default(uuid(7))
+  actorType ActorType
+
+  actorUserId     String?
+  actorCustomerId String?
+
+  action     String
+  entityType String
+  entityId   String
+  branchId   String?
+
+  before Json?
+  after  Json?
+
+  outcome AuditOutcome @default(SUCCESS)
+  reason  String?
+
+  correlationId String?
+  ipAddress     String?
+  userAgent     String?
+
+  createdAt DateTime @default(now())
+
+  actorUser     User?     @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  actorCustomer Customer? @relation(fields: [actorCustomerId], references: [id], onDelete: SetNull)
+  branch        Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId, createdAt])
+  @@index([branchId, createdAt])
+  @@index([createdAt])
+  @@index([correlationId])
+  @@index([actorCustomerId])
+}
+
+// =============================================================================
+// Authentication
+// =============================================================================
+
+/// A one-time passcode challenge.
+///
+/// The code itself is NEVER stored — only an Argon2 hash of it. A database
+/// dump therefore yields no usable codes, and the code cannot be read back out
+/// by staff tooling or leak through a query log.
+///
+/// Challenges are single-use (`consumedAt`), time-boxed (`expiresAt`) and
+/// attempt-limited (`attempts` vs `maxAttempts`), so a six-digit code cannot be
+/// brute-forced.
+model OtpChallenge {
+  id       String     @id @default(uuid(7))
+  /// E.164 phone number the code was sent to.
+  phone    String
+  /// Argon2id hash of the code. Never the code.
+  codeHash String
+  purpose  OtpPurpose @default(CUSTOMER_LOGIN)
+
+  attempts    Int @default(0)
+  maxAttempts Int @default(5)
+
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  /// Set when a challenge is superseded by a newer one, or invalidated after
+  /// too many failed attempts.
+  invalidatedAt DateTime?
+
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([phone, createdAt])
+  @@index([expiresAt])
+}
+
+/// An issued refresh token.
+///
+/// Only a SHA-256 hash of the opaque token is stored, so a database leak does
+/// not hand an attacker working sessions.
+///
+/// `familyId` implements rotation with theft detection: each refresh issues a
+/// new token in the same family and revokes the old one. If an already-rotated
+/// token is ever presented again, the token was replayed — the entire family is
+/// revoked, logging out the attacker and the legitimate holder alike, which is
+/// the correct trade when a credential is known to be compromised.
+model RefreshToken {
+  id        String @id @default(uuid(7))
+  tokenHash String @unique
+
+  /// Exactly one of these is set. Enforced by a database CHECK constraint, so
+  /// a token can never belong to both a staff user and a customer.
+  userId     String?
+  customerId String?
+
+  familyId String
+
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+  lastUsedAt    DateTime?
+
+  userAgent String?
+  ipAddress String?
+
+  createdAt DateTime @default(now())
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId])
+  @@index([customerId])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// Feature Flags
+// =============================================================================
+
+model FeatureFlag {
+  id          String  @id @default(uuid(7))
+  key         String  @unique
+  enabled     Boolean @default(false)
+  description String?
+
+  updatedByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  updatedByUser User? @relation(fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([key])
+  @@index([updatedByUserId])
+}
+
+// =============================================================================
+// Banners (advertisement / promotional)
+// =============================================================================
+
+enum BannerAction {
+  NONE
+  PRODUCT
+  CATEGORY
+  BRANCH
+  EXTERNAL_URL
+  OFFERS
+}
+
+model Banner {
+  id            String       @id @default(uuid(7))
+  name          String
+  imageUrl      String
+  imageUrlAr    String?
+  title         String
+  titleAr       String?
+  description   String?
+  descriptionAr String?
+  buttonText    String?
+  buttonTextAr  String?
+  action        BannerAction @default(NONE)
+  targetId      String?
+  targetUrl     String?
+  branchIds     String[]
+  priority      Int          @default(0)
+  startsAt      DateTime?
+  endsAt        DateTime?
+  isActive      Boolean      @default(false)
+  publishedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, priority])
+}
+
+// =============================================================================
+// Promotions / Offers
+// =============================================================================
+
+model Promotion {
+  id            String  @id @default(uuid(7))
+  name          String
+  nameAr        String?
+  description   String?
+  descriptionAr String?
+  imageUrl      String?
+
+  discountType     DiscountType
+  discountValue    Decimal      @db.Decimal(12, 2)
+  maxDiscountMinor Int?
+
+  /// Branches this promotion applies to. Empty = all branches.
+  branchIds String[]
+
+  startsAt DateTime
+  endsAt   DateTime
+  isActive Boolean  @default(false)
+
+  priority Int @default(0)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  items          PromotionItem[]
+  orders         Order[]
+  orderDiscounts OrderDiscount[]
+
+  @@index([isActive, startsAt, endsAt])
+}
+
+model PromotionItem {
+  id          String @id @default(uuid(7))
+  promotionId String
+  productId   String
+
+  createdAt DateTime @default(now())
+
+  promotion Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([promotionId, productId])
+  @@index([productId])
+}
+
+// =============================================================================
+// Homepage Builder
+// =============================================================================
+
+enum HomepageSectionKind {
+  BANNERS
+  CATEGORIES
+  FEATURED
+  BESTSELLERS
+  POPULAR
+  OFFERS
+  COUPONS
+  LOYALTY
+  RECOMMENDED
+  CUSTOM
+}
+
+model HomepageSection {
+  id       String              @id @default(uuid(7))
+  kind     HomepageSectionKind
+  title    String?
+  titleAr  String?
+  position Int                 @default(0)
+  enabled  Boolean             @default(true)
+  config   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([kind])
+  @@index([position])
+}
+
+// =============================================================================
+// Config Versioning
+// =============================================================================
+
+model ConfigVersion {
+  id      String @id @default(uuid(7))
+  version Int    @default(1)
+
+  /// Singleton row — only one row should exist. Enforced by the unique key below.
+  singletonKey String @unique @default("config")
+
+  updatedAt DateTime @updatedAt
+}
+
+// =============================================================================
+// Idempotency
+// =============================================================================
+
+/// Request de-duplication for financial operations.
+///
+/// The unique `key` is claimed before the work begins, so a concurrent replay
+/// loses the race and returns the stored response instead of charging twice.
+/// `requestHash` catches a client reusing a key with a different payload, which
+/// is a client bug that must fail loudly rather than silently return the wrong
+/// stored result.
+model IdempotencyRecord {
+  id    String @id @default(uuid(7))
+  key   String
+  /// Namespace, e.g. "payment.create" or "refund.create", so keys cannot
+  /// collide across unrelated operations.
+  scope String
+
+  requestHash String
+  status      IdempotencyStatus @default(IN_PROGRESS)
+
+  responseStatus Int?
+  responseBody   Json?
+
+  lockedAt    DateTime  @default(now())
+  completedAt DateTime?
+  /// Records are purged after this time by a scheduled job.
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ZATCA e-invoicing via RestoPOS
+//
+// ZATCA invoicing is not implemented in this backend — it is delegated to the
+// RestoPOS ZATCA service (see src/zatca-invoicing/). These tables hold only the
+// *link* to what RestoPOS issued: the per-branch licence a branch's chain lives
+// on, and the reference + status + QR of each document RestoPOS produced for an
+// order. No tax arithmetic and no certificate material lives here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum ZatcaProvisionStatus {
+  PENDING_APPROVAL
+  READY
+  FAILED
+}
+
+enum ZatcaDocumentKind {
+  INVOICE
+  CREDIT_NOTE
+}
+
+/// ZATCA submission state of one document, as RestoPOS reports it. A simplified
+/// (B2C) invoice is valid to hand the customer at PENDING and is REPORTED to
+/// ZATCA within 24h; a standard (B2B) invoice must be CLEARED before issue.
+enum ZatcaSubmissionState {
+  PENDING
+  REPORTED
+  CLEARED
+  FAILED
+}
+
+/// One Rami Broast branch's RestoPOS licence — its own ZATCA device/chain,
+/// grouped under the chain-owner account. One branch = one licence (ZATCA
+/// requires a separate invoice chain per branch).
+model BranchZatcaRegistration {
+  id       String @id @default(uuid(7))
+  branchId String @unique
+
+  /// RestoPOS licence key (e.g. `EXT-…`). Unique across the platform.
+  licenseKey String @unique
+
+  /// RestoPOS API key for this branch. Sensitive: it authorises issuing invoices
+  /// on this branch's chain. Held here for the demo; at go-live it moves to
+  /// Secret Manager and this column carries a reference instead. Redacted in
+  /// logs (see logger.module.ts).
+  apiKey String?
+
+  status        ZatcaProvisionStatus @default(PENDING_APPROVAL)
+  provisionNote String?
+
+  /// The shared VAT number and this branch's own CR, echoed for display and
+  /// so a mismatch with the branch record is visible. Not the source of truth —
+  /// the certificate RestoPOS holds is.
+  vatNumber String?
+  crNumber  String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  branch   Branch           @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  invoices RestoposInvoice[]
+
+  @@index([status])
+}
+
+/// A tax invoice or credit note RestoPOS issued for one order. Append-only in
+/// spirit: an order gets one INVOICE and, if refunded, one CREDIT_NOTE.
+model RestoposInvoice {
+  id       String @id @default(uuid(7))
+  orderId  String
+  branchId String
+
+  registrationId String
+
+  kind ZatcaDocumentKind @default(INVOICE)
+
+  /// RestoPOS document id, scoped to the branch's licence. Unique.
+  documentId   String @unique
+  serialNumber String
+
+  submissionStatus ZatcaSubmissionState @default(PENDING)
+
+  /// SHA-256 invoice hash (chain link) and the TLV/base64 QR the customer app
+  /// renders. Snapshots of what RestoPOS returned.
+  invoiceHash String?
+  qr          String?
+
+  /// Reconciled document totals in halalas, mirroring the order's captured
+  /// total. Stored so a report never has to re-derive them.
+  totalExclusiveMinor Int
+  totalVatMinor       Int
+  totalInclusiveMinor Int
+
+  /// For a credit note: the invoice document it amends.
+  originalInvoiceId String?
+
+  issuedAt   DateTime
+  reportedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order        Order                   @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  branch       Branch                  @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  registration BranchZatcaRegistration @relation(fields: [registrationId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, kind])
+  @@index([branchId, submissionStatus])
+  @@index([submissionStatus])
+}
