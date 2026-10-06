@@ -1,0 +1,29 @@
+# gitleaks configuration.
+#
+# Extends the default ruleset and allowlists the fake secret-shaped strings two
+# tests deliberately embed as fixtures. No real credentials live in either.
+#
+# Keep both halves tight. The path list is one known fixture file; the regex
+# list matches the exact fake value rather than exempting the file holding it,
+# so a real key pasted into the QZ signing test is still caught.
+
+title = "Rami Broast backend gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures: fake secrets asserted against, never real credentials"
+paths = [
+  '''test/unit/all-exceptions\.filter\.spec\.ts''',
+]
+
+# The QZ Tray signing test needs a PEM-shaped value: `normalisePem` and
+# `crypto.createSign` both read the armour, so a fixture without the
+# `-----BEGIN PRIVATE KEY-----` header would assert nothing. Its body is the
+# three characters `xyz`, which no real key has, and the `\n` are the two
+# literal characters an environment variable hands a PEM back as — which is
+# the case that test exists to cover.
+regexes = [
+  '''-----BEGIN PRIVATE KEY-----\\nxyz\\n-----END PRIVATE KEY-----''',
+]

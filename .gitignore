@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test output
+coverage/
+.jest-cache/
+
+# Environment / secrets — NEVER commit real values (see SECURITY.md)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cert
+*.crt
+*.csr
+secrets/
+credentials/
+
+# ZATCA / payment artefacts that may embed credentials or certificates
+zatca-certs/
+*.zatca.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Prisma local artefacts
+prisma/*.db
+prisma/*.db-journal

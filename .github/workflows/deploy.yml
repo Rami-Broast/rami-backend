@@ -1,0 +1,199 @@
+# CI/CD: build and deploy the backend to Cloud Run on push to main.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THIS IS THE **DEMO** DEPLOY. It is not the production one.
+#
+# It deliberately carries demo-only affordances that must never reach real
+# customers: a pinned OTP that signs anyone in, and a mock gateway that settles
+# its own charges. Production has its own workflow — `deploy-production.yml` —
+# which sets NODE_ENV=production, omits both, and is manually triggered.
+#
+# The split exists because those two settings were previously in the *only*
+# deploy workflow, on push to main. The backend already contained guards that
+# refuse them (`resolveDemoFixedCode`, `assertProductionPaymentRails`), and this
+# workflow routed around every one of them by setting NODE_ENV=staging — so the
+# guards could never fire and the demo configuration was one merge away from
+# being the launch configuration.
+#
+# Do not add NODE_ENV=production here, and do not copy these env vars into the
+# production workflow.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Copied from infrastructure/.github/workflows/deploy-backend-cloudrun.yml (the
+# template) and adapted for the client demo:
+#   - NODE_ENV=staging (NOT production): src/config/configuration.ts refuses
+#     OTP_DEMO_FIXED_CODE when NODE_ENV=production, so staging keeps the pinned
+#     demo OTP (123456) working while everything else stays demo-safe.
+#   - Runs `prisma migrate deploy` + the permission seed against Cloud SQL over
+#     the Cloud SQL Auth Proxy BEFORE rollout, so database setup never needs
+#     Cloud Shell.
+#
+# Auth uses Workload Identity Federation — no long-lived JSON key is committed.
+# Required repo settings (Settings > Secrets and variables > Actions):
+#   vars.GCP_PROJECT_ID   vars.GCP_REGION   vars.CLOUDSQL_CONN   vars.CLIENT_ORIGINS
+#   secrets.GCP_WORKLOAD_IDENTITY_PROVIDER   secrets.GCP_DEPLOY_SA_EMAIL
+
+name: Deploy backend — DEMO (Cloud Run)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+concurrency:
+  group: deploy-backend-demo
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Apply migrations + seed permission codes before the new revision serves
+      # traffic. Connects through the Cloud SQL Auth Proxy using the job's WIF
+      # credentials; no password or IP allowlist involved.
+      - name: Migrate and seed (Cloud SQL Auth Proxy)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSQL_CONN: ${{ vars.CLOUDSQL_CONN }}
+        run: |
+          set -euo pipefail
+
+          # The DATABASE_URL secret is in Cloud Run unix-socket form
+          # (…@localhost/bah?host=/cloudsql/CONN). Fetch it, mask it, and rewrite
+          # it to a TCP URL that targets the local proxy.
+          RAW_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL --project="$PROJECT_ID")"
+          echo "::add-mask::$RAW_URL"
+          TCP_URL="$(printf '%s' "$RAW_URL" | sed -E 's#@localhost/([^?]+)\?host=/cloudsql/[^&]+#@127.0.0.1:5432/\1#')"
+          echo "::add-mask::$TCP_URL"
+
+          curl -sSL -o cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --port 5432 "$CLOUDSQL_CONN" &
+          PROXY_PID=$!
+
+          # Wait until the proxy accepts TCP connections (max ~30s).
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          npm ci
+          DATABASE_URL="$TCP_URL" npx prisma migrate deploy
+          DATABASE_URL="$TCP_URL" npm run prisma:seed
+
+          kill "$PROXY_PID" 2>/dev/null || true
+
+      # Cloud Run builds the repo Dockerfile via Cloud Build, then deploys.
+      # --set-env-vars uses the ^@^ delimiter so commas inside ADMIN_ORIGINS
+      # (multiple CORS origins) are preserved.
+      - name: Deploy service
+        run: |
+          gcloud run deploy rami-api \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --source . \
+            --platform managed \
+            --add-cloudsql-instances "${{ vars.CLOUDSQL_CONN }}" \
+            --allow-unauthenticated \
+            --port 3000 \
+            --quiet \
+            --set-env-vars "^@^NODE_ENV=staging@OTP_DEMO_FIXED_CODE=123456@LOG_LEVEL=info@LOG_PRETTY=false@SWAGGER_ENABLED=false@TRUSTED_PROXY_HOPS=1@PAYMENT_GATEWAY=mock@PAYMENT_SANDBOX=true@PAYMENT_MOCK_AUTO_SETTLE=true@SMS_PROVIDER=mock@PUSH_PROVIDER=mock@VAT_STANDARD_RATE=0.15@PRICES_INCLUDE_VAT=true@DELIVERY_FEE_TAXABLE=true@LOYALTY_POINTS_PER_SAR=1@CORS_ALLOWED_ORIGINS=${{ vars.CLIENT_ORIGINS }}" \
+            --set-secrets "DATABASE_URL=DATABASE_URL:latest,JWT_ACCESS_SECRET=JWT_ACCESS_SECRET:latest,PAYMENT_MOCK_WEBHOOK_SECRET=PAYMENT_MOCK_WEBHOOK_SECRET:latest"
+
+      - name: Report service URL
+        run: |
+          URL="$(gcloud run services describe rami-api \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          {
+            echo "### Cloud Run deploy complete"
+            echo ""
+            echo "- Service URL: $URL"
+            echo "- Clients use: \`$URL/api/v1\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Service URL: $URL"
+          echo "API base:    $URL/api/v1"
+
+      # Every browser client is refused unless its exact origin is in
+      # CORS_ALLOWED_ORIGINS, and the refusal is invisible from the app: the
+      # browser hides the reason, `fetch` throws the same opaque TypeError it
+      # throws for a flat battery, and the client says "could not reach the
+      # server". So a missing origin does not surface here, or in CI, or in any
+      # test — it surfaces as a driver who cannot sign in, and it costs a day.
+      #
+      # This step sends a real preflight from each origin in the list and fails
+      # the job if any is refused. It runs after the rollout deliberately: the
+      # service is already live either way, and a red deploy naming the origin
+      # is the cheapest place to learn this.
+      #
+      # It cannot catch an origin nobody put in the variable — for that, see
+      # infrastructure/docs/client-origins-and-cors.md, which lists all four.
+      - name: Verify CORS allows every configured client origin
+        env:
+          CLIENT_ORIGINS: ${{ vars.CLIENT_ORIGINS }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${CLIENT_ORIGINS// /}" ]; then
+            echo "::error::CLIENT_ORIGINS is empty. bootstrap.ts only calls enableCors() for a non-empty list, so every browser client — admin, POS, customer and driver — is now blocked."
+            exit 1
+          fi
+
+          URL="$(gcloud run services describe rami-api \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+
+          # A public POST route: the one every client hits before it holds a
+          # token, and the request a CORS failure is actually reported against.
+          ENDPOINT="$URL/api/v1/auth/staff/login"
+          FAILED=0
+
+          IFS=',' read -ra ORIGINS <<< "$CLIENT_ORIGINS"
+          for ORIGIN in "${ORIGINS[@]}"; do
+            ORIGIN="$(echo "$ORIGIN" | tr -d '[:space:]')"
+            [ -z "$ORIGIN" ] && continue
+
+            ALLOWED="$(curl -sS -X OPTIONS "$ENDPOINT" \
+              -H "Origin: $ORIGIN" \
+              -H 'Access-Control-Request-Method: POST' \
+              -H 'Access-Control-Request-Headers: content-type,authorization' \
+              -D - -o /dev/null --max-time 30 \
+              | tr -d '\r' | tr 'A-Z' 'a-z' \
+              | sed -n 's/^access-control-allow-origin:[[:space:]]*//p' | tail -n1)"
+
+            # The header is compared lowercased, since it was lowercased above.
+            if [ "$ALLOWED" = "$(echo "$ORIGIN" | tr 'A-Z' 'a-z')" ] || [ "$ALLOWED" = "*" ]; then
+              echo "  ok      $ORIGIN"
+            else
+              echo "::error::CORS preflight refused $ORIGIN — the app at that origin cannot reach the API at all, and will report it as a connection failure."
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Fix: update the CLIENT_ORIGINS repository variable (Settings > Secrets and variables > Actions > Variables) and re-run this workflow."
+            exit 1
+          fi
+
+          echo "All ${#ORIGINS[@]} configured origins are allowed."

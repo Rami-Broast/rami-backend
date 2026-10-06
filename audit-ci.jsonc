@@ -1,0 +1,33 @@
+{
+  // NOT READ BY CI ANY MORE. Kept for the assessment recorded below.
+  //
+  // CI gates through `scripts/audit-gate.sh` instead: `audit-ci` hangs on the
+  // advisory endpoint from GitHub's runners (three 120s attempts, no output,
+  // twice on two commits), and a security check that goes red because a third
+  // party was slow is worse than none — it teaches people to re-run it on
+  // sight. The script keeps the same high/critical bar but tells a finding
+  // apart from an outage.
+  //
+  // It has no allowlist, because the one entry below is currently moot: the
+  // npm overrides in package.json resolve GHSA-ggr8-5vv4-36mx, and `npm audit`
+  // reports 0 vulnerabilities. If an advisory ever genuinely needs an
+  // exception, prefer an override or an upgrade; a permanent exception should
+  // be a deliberate, argued change to the script.
+  //
+  // Dependency vulnerability gate for CI. Fails the build on any high or
+  // critical advisory EXCEPT those explicitly allowlisted below with a reason.
+  // Keeps the same high-severity bar as the previous `npm audit --audit-level=high`.
+  "high": true,
+  "critical": true,
+  "report-type": "important",
+  "allowlist": [
+    // GHSA-ggr8-5vv4-36mx — deepmerge-ts <8.0.0 stack exhaustion on recursive
+    // object graphs. Pulled transitively via @prisma/client → prisma →
+    // @prisma/config. Only reachable through Prisma loading the developer-authored
+    // prisma.config.ts at build/CLI time — never from a runtime request path with
+    // untrusted input — so real-world risk here is negligible. The only fix is
+    // deepmerge-ts >=8, which requires a Prisma 6 → 7 major upgrade; tracked
+    // separately. Re-evaluate this entry when Prisma is upgraded.
+    "GHSA-ggr8-5vv4-36mx"
+  ]
+}

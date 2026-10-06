@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: ['feature/**', 'claude/**', development]
+  pull_request:
+    branches: [development, main]
+
+# Cancel superseded runs on the same ref to keep feedback fast.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  static-analysis:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run unit tests
+        run: npm run test -- --ci
+
+  database-tests:
+    name: Integration and e2e tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rdp
+          POSTGRES_PASSWORD: ci_throwaway
+          POSTGRES_DB: rdp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rdp -d rdp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Throwaway credentials for an ephemeral CI container — not a secret.
+      DATABASE_URL: postgresql://rdp:ci_throwaway@localhost:5432/rdp_test?schema=public
+      NODE_ENV: test
+      # Throwaway signing key for an ephemeral CI process — not a secret.
+      JWT_ACCESS_SECRET: ci_throwaway_signing_key_not_a_real_secret
+      SMS_PROVIDER: mock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Apply migrations
+        run: npm run prisma:deploy
+
+      - name: Create a shadow database for the drift check
+        # `migrate diff` RESETS whatever it is given as a shadow database, so it
+        # must never be pointed at the database the tests then run against.
+        run: PGPASSWORD=ci_throwaway psql -h localhost -U rdp -d rdp_test -c 'CREATE DATABASE rdp_shadow;'
+
+      - name: Verify the schema matches the migrations
+        # Fails if schema.prisma has drifted from the committed migration
+        # history — a schema edit that was never migrated would otherwise pass
+        # CI here and break on deploy.
+        run: npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "postgresql://rdp:ci_throwaway@localhost:5432/rdp_shadow?schema=public" --exit-code
+
+      - name: Run integration tests
+        run: npm run test:integration -- --ci
+
+      - name: Run end-to-end tests
+        run: npm run test:e2e -- --ci
+
+  security:
+    name: Dependency and secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the secret scan can inspect the whole diff range.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Audit dependencies
+        # See scripts/audit-gate.sh for why this is a script rather than
+        # `npx audit-ci`: that tool hangs on the advisory endpoint from these
+        # runners, and a check that goes red because a third party was slow
+        # trains everyone to re-run the security job on sight.
+        run: ./scripts/audit-gate.sh
+
+      - name: Verify no .env file was committed
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked in git. Secrets must never be committed."
+            exit 1
+          fi
+          echo "No tracked .env file."
+
+      - name: Scan for committed secrets
+        # Runs the open-source gitleaks CLI directly instead of
+        # gitleaks/gitleaks-action@v2, which now requires a paid GITLEAKS_LICENSE
+        # for GitHub organizations. The CLI is the same scanner, license-free.
+        # fetch-depth: 0 (above) gives it full history; .gitleaks.toml holds the
+        # allowlist for known test fixtures.
+        run: |
+          GITLEAKS_VERSION=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks detect --source=. --config=.gitleaks.toml --redact -v --exit-code=1
