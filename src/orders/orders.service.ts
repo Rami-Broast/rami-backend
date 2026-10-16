@@ -93,7 +93,19 @@ const orderInclude = {
   // printing one anonymous "Discount" for a promotion and a code together.
   discounts: { orderBy: { createdAt: 'asc' } },
   statusHistory: { orderBy: { createdAt: 'asc' } },
-  branch: { select: { id: true, code: true, name: true, nameAr: true } },
+  // `settings.prepTimeMinutes` lets a client show an honest "ready in ~X min"
+  // estimate from the order's own confirmedAt/preparingAt timestamps, rather
+  // than inventing a number. Null means the branch has set no prep time, and a
+  // client must show no estimate rather than a fabricated one.
+  branch: {
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      nameAr: true,
+      settings: { select: { prepTimeMinutes: true } },
+    },
+  },
   // `_count.orders` is how a docket can say "new customer" without a second
   // request per print. It counts this order too, so one order is a first
   // order — a client reading it must say so, rather than deriving anything

@@ -1,0 +1,262 @@
+# Deploy the backend to Cloud Run for a **CLOSED PILOT**.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the THIRD deploy workflow, and the split from the other two is the
+# whole point. `deploy.yml` is the throwaway DEMO; `deploy-production.yml` is the
+# real, SMS-gated PRODUCTION. This one sits deliberately between them: a real,
+# running service taking real COD/pickup orders for a **small, trusted group of
+# customers you have onboarded by hand** — not the open public.
+#
+# It exists because a real SMS/OTP provider is not yet contracted, so the only
+# working customer login is the pinned demo OTP (123456). That is acceptable for
+# a closed pilot and NOT acceptable for a public launch — see "ACCEPTED RISKS".
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# HOW THIS DIFFERS FROM THE DEMO (`deploy.yml`) — the hardening:
+#
+#   PAYMENT_SANDBOX=false          The demo sets this `true`, which opens the
+#                                  public, unauthenticated
+#                                  `POST /webhooks/payments/:gateway/simulate`
+#                                  endpoint — anyone who can reach the API can
+#                                  mark any order PAID. A pilot serving real
+#                                  people must not expose it. Off here.
+#   PAYMENT_MOCK_AUTO_SETTLE=false The demo sets this `true` so mock online
+#                                  orders self-settle. A COD/pickup pilot takes
+#                                  no online payment, so it is off — and with it
+#                                  off, an online order (if a client ever offered
+#                                  one) would simply sit PENDING_PAYMENT rather
+#                                  than being marked paid for free. Fail-safe.
+#
+# WHAT IT STILL SHARES WITH THE DEMO, and why it must:
+#
+#   NODE_ENV=staging               Load-bearing. The boot guard
+#                                  `resolveDemoFixedCode` REFUSES
+#                                  OTP_DEMO_FIXED_CODE under NODE_ENV=production.
+#                                  The pinned OTP is the only customer login that
+#                                  works today, so the pilot cannot be
+#                                  NODE_ENV=production. The moment a real SMS
+#                                  provider lands, this workflow is retired and
+#                                  `deploy-production.yml` takes over.
+#   OTP_DEMO_FIXED_CODE=123456     The pinned login. See ACCEPTED RISKS.
+#   PAYMENT_GATEWAY=mock           No real card payments in a COD/pickup pilot.
+#                                  Kept `mock` (not `tap`) so that if a client
+#                                  ever did offer online pay, it fails benignly
+#                                  (pending) rather than throwing a 503 from the
+#                                  deliberately-unimplemented Tap stub.
+#   SMS_PROVIDER=mock              Delivers nothing; the pinned OTP stands in for
+#                                  a real code. This is the one thing that must
+#                                  change to graduate to production.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ACCEPTED RISKS — read before running, and keep the pilot closed because of them:
+#
+#   1. The pinned OTP (123456) is accepted for ANY phone number. Anyone who
+#      knows a customer's number can sign in AS them — see their addresses and
+#      order history and place COD orders in their name. This is tolerable ONLY
+#      while the customer set is small, trusted and hand-onboarded, and the app
+#      URL is not advertised publicly. It is an account-takeover hole against the
+#      open public. Do not treat this pilot as a soft launch to strangers.
+#
+#   2. Clients MUST offer only COD and pickup (and COD delivery). No online card
+#      method should be selectable. Nothing in this backend forces that — it is a
+#      client-side configuration requirement. See docs/pilot-deploy.md.
+#
+# GRADUATING TO PRODUCTION (do this, do not keep extending the pilot):
+#   See docs/sms-provider-integration.md and docs/pilot-deploy.md § Graduation.
+#   In short: add a real provider to the `SmsProvider` enum + an adapter, add the
+#   production boot guard, set the SMS_PROVIDER repo var, then deploy through
+#   `deploy-production.yml` (NODE_ENV=production, no pinned OTP). This workflow
+#   is then deleted.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Manual trigger only, with a confirmation phrase, and scoped to a `pilot`
+# GitHub Environment so a required reviewer can gate it. A closed pilot is never
+# redeployed by merging to a branch.
+#
+# Required repo settings (Settings > Secrets and variables > Actions):
+#   vars.GCP_PROJECT_ID    vars.GCP_REGION    vars.CLOUDSQL_CONN
+#   vars.CLIENT_ORIGINS    vars.PILOT_SERVICE_NAME
+#   secrets.GCP_WORKLOAD_IDENTITY_PROVIDER   secrets.GCP_DEPLOY_SA_EMAIL
+#
+# Use a SEPARATE Cloud Run service, Cloud SQL database and CLIENT_ORIGINS from
+# the demo — a pilot holding real customers' orders must not share a database
+# with a throwaway demo that anyone can mark paid.
+#
+# Secrets are read from Secret Manager by name, never passed through GitHub.
+
+name: Deploy backend — PILOT (Cloud Run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy-pilot" to confirm. This serves real pilot customers.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for Workload Identity Federation
+
+concurrency:
+  group: deploy-backend-pilot
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Attach a protected GitHub Environment so a human approval can be required
+    # before this runs. Configure reviewers under Settings > Environments.
+    environment: pilot
+
+    steps:
+      - name: Refuse an unconfirmed run
+        if: ${{ inputs.confirm != 'deploy-pilot' }}
+        run: |
+          echo "::error::Confirmation phrase did not match. Nothing was deployed."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA_EMAIL }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Guard against pointing the pilot at the demo's own Cloud Run service.
+      # They must be different services, or a pilot deploy silently overwrites
+      # the demo (or vice versa) and the two share a database.
+      - name: Refuse to reuse the demo service name
+        env:
+          PILOT_SERVICE_NAME: ${{ vars.PILOT_SERVICE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PILOT_SERVICE_NAME:-}" ]; then
+            echo "::error::vars.PILOT_SERVICE_NAME is unset. Set a distinct service name (not the demo's 'rami-api')."
+            exit 1
+          fi
+          if [ "${PILOT_SERVICE_NAME}" = "rami-api" ]; then
+            echo "::error::vars.PILOT_SERVICE_NAME is 'rami-api', the DEMO service. The pilot must be its own service with its own database."
+            exit 1
+          fi
+          echo "Pilot service: ${PILOT_SERVICE_NAME}"
+
+      # Apply migrations + seed permission codes before the new revision serves
+      # traffic, through the Cloud SQL Auth Proxy — no password or IP allowlist.
+      - name: Migrate and seed (Cloud SQL Auth Proxy)
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSQL_CONN: ${{ vars.CLOUDSQL_CONN }}
+        run: |
+          set -euo pipefail
+
+          RAW_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL --project="$PROJECT_ID")"
+          echo "::add-mask::$RAW_URL"
+          TCP_URL="$(printf '%s' "$RAW_URL" | sed -E 's#@localhost/([^?]+)\?host=/cloudsql/[^&]+#@127.0.0.1:5432/\1#')"
+          echo "::add-mask::$TCP_URL"
+
+          curl -sSL -o cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy --port 5432 "$CLOUDSQL_CONN" &
+          PROXY_PID=$!
+
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          npm ci
+          DATABASE_URL="$TCP_URL" npx prisma migrate deploy
+          DATABASE_URL="$TCP_URL" npm run prisma:seed
+
+          kill "$PROXY_PID" 2>/dev/null || true
+
+      # NODE_ENV=staging keeps the pinned OTP working (the production guard would
+      # refuse it). PAYMENT_SANDBOX and PAYMENT_MOCK_AUTO_SETTLE are false — the
+      # two values that separate this from the demo. The ^@^ delimiter preserves
+      # commas inside CLIENT_ORIGINS.
+      - name: Deploy service
+        run: |
+          gcloud run deploy "${{ vars.PILOT_SERVICE_NAME }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --source . \
+            --platform managed \
+            --add-cloudsql-instances "${{ vars.CLOUDSQL_CONN }}" \
+            --allow-unauthenticated \
+            --port 3000 \
+            --quiet \
+            --set-env-vars "^@^NODE_ENV=staging@OTP_DEMO_FIXED_CODE=123456@LOG_LEVEL=info@LOG_PRETTY=false@SWAGGER_ENABLED=false@TRUSTED_PROXY_HOPS=1@PAYMENT_GATEWAY=mock@PAYMENT_SANDBOX=false@PAYMENT_MOCK_AUTO_SETTLE=false@SMS_PROVIDER=mock@PUSH_PROVIDER=mock@VAT_STANDARD_RATE=0.15@PRICES_INCLUDE_VAT=true@DELIVERY_FEE_TAXABLE=true@LOYALTY_POINTS_PER_SAR=1@CORS_ALLOWED_ORIGINS=${{ vars.CLIENT_ORIGINS }}" \
+            --set-secrets "DATABASE_URL=DATABASE_URL:latest,JWT_ACCESS_SECRET=JWT_ACCESS_SECRET:latest,PAYMENT_MOCK_WEBHOOK_SECRET=PAYMENT_MOCK_WEBHOOK_SECRET:latest"
+
+      - name: Report service URL
+        run: |
+          URL="$(gcloud run services describe "${{ vars.PILOT_SERVICE_NAME }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+          {
+            echo "### Pilot deploy complete"
+            echo ""
+            echo "- Service URL: $URL"
+            echo "- Clients use: \`$URL/api/v1\`"
+            echo "- Login: pinned OTP 123456 (closed pilot — keep the URL private)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A missing CORS origin surfaces not here but as a customer who cannot sign
+      # in, so preflight every configured origin and fail loudly if one is
+      # refused. Same check as the demo workflow.
+      - name: Verify CORS allows every configured client origin
+        env:
+          CLIENT_ORIGINS: ${{ vars.CLIENT_ORIGINS }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${CLIENT_ORIGINS// /}" ]; then
+            echo "::error::CLIENT_ORIGINS is empty. Every browser client is now blocked by CORS."
+            exit 1
+          fi
+
+          URL="$(gcloud run services describe "${{ vars.PILOT_SERVICE_NAME }}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --format='value(status.url)')"
+
+          ENDPOINT="$URL/api/v1/auth/staff/login"
+          FAILED=0
+
+          IFS=',' read -ra ORIGINS <<< "$CLIENT_ORIGINS"
+          for ORIGIN in "${ORIGINS[@]}"; do
+            ORIGIN="$(echo "$ORIGIN" | tr -d '[:space:]')"
+            [ -z "$ORIGIN" ] && continue
+
+            ALLOWED="$(curl -sS -X OPTIONS "$ENDPOINT" \
+              -H "Origin: $ORIGIN" \
+              -H 'Access-Control-Request-Method: POST' \
+              -H 'Access-Control-Request-Headers: content-type,authorization' \
+              -D - -o /dev/null --max-time 30 \
+              | tr -d '\r' | tr 'A-Z' 'a-z' \
+              | sed -n 's/^access-control-allow-origin:[[:space:]]*//p' | tail -n1)"
+
+            if [ "$ALLOWED" = "$(echo "$ORIGIN" | tr 'A-Z' 'a-z')" ] || [ "$ALLOWED" = "*" ]; then
+              echo "  ok      $ORIGIN"
+            else
+              echo "::error::CORS preflight refused $ORIGIN — that client cannot reach the API at all."
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Fix: update the CLIENT_ORIGINS repository variable and re-run this workflow."
+            exit 1
+          fi
+
+          echo "All ${#ORIGINS[@]} configured origins are allowed."
