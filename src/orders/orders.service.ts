@@ -98,7 +98,13 @@ const orderInclude = {
   // than inventing a number. Null means the branch has set no prep time, and a
   // client must show no estimate rather than a fabricated one.
   branch: {
-    select: { id: true, code: true, name: true, nameAr: true, settings: { select: { prepTimeMinutes: true } } },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      nameAr: true,
+      settings: { select: { prepTimeMinutes: true } },
+    },
   },
   // `_count.orders` is how a docket can say "new customer" without a second
   // request per print. It counts this order too, so one order is a first
