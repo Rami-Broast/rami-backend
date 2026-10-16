@@ -41,10 +41,18 @@ workflows.
 
 2. **Clients must offer only COD / pickup (and COD delivery).** No online card
    method may be selectable. The backend does not force this — it is a
-   client-side configuration requirement in the customer app and POS checkout.
-   If an online method were offered and chosen, with the hardened settings the
-   order would sit in `PENDING_PAYMENT` (never confirmed, never charged) rather
-   than being marked paid — benign, but a dead end for that customer.
+   client-side configuration requirement:
+   - **customer-app:** the `ONLINE_PAYMENTS_ENABLED` build-time flag
+     (`app.config.js` → `expo.extra.onlinePaymentsEnabled`) gates this. It is
+     **off by default**, which makes checkout cash-on-delivery-only; do **not**
+     set it to `true` for the pilot. Turning it on is the day Tap goes live.
+   - **kitchen-pos (counter orders):** already cash/COD-only by design — it
+     offers only cash-now / cash-later / COD and has no online path.
+
+   If an online method were offered and chosen anyway, with the hardened
+   settings the order would sit in `PENDING_PAYMENT` (never confirmed, never
+   charged) rather than being marked paid — benign, but a dead end for that
+   customer.
 
 ## Operational requirements
 
